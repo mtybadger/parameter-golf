@@ -2,7 +2,7 @@ This record captures the `NorMuon + Selective Quantization` ideas, as well as so
 
 Trainer changes in this snapshot:
 - Vocab size 1024 -> 8192
-- New "sp8192" tokenizer trained simply using `data/download_hf_docs_and_tokenize.py   --output-root ./data   --tokenizer-config ./data/tokenizer_specs.json` with 100000 docs for a 50/50 val/train split
+- New "sp8192" tokenizer trained simply using `./data/download_hf_docs_and_tokenize.py   --output-root ./data   --tokenizer-config ./data/tokenizer_specs.json --max-train-tokens 8000000000 --tokenizer-train-docs 100000` with 100000 docs for a 50/50 val/train split
 - NorMuon implementation from ``
 - Selective Quantization: the weights are post-training quantized to int6, while the embeddings are kept at int8. Not sure if this is optimal and have seen plenty of weird behaviour from this, but I think it's in the right direction; I think quantization will be really key to this challenge and I want to dig into it more. From now on there will be a lot of trading off flexibility in various parameters, and I think selectively quantizing some more than others will allow us to do that more fine-grained!
 
@@ -13,13 +13,28 @@ Command:
 ```bash
 NCCL_IB_DISABLE=1 \
 RUN_ID=hf_verify_sp1024_8gpu \
-DATA_PATH=/root/code/parameter-golf/data/datasets/fineweb10B_sp1024 \
-TOKENIZER_PATH=/root/code/parameter-golf/data/tokenizers/fineweb_1024_bpe.model \
+DATA_PATH=./data/datasets/fineweb10B_sp1024 \
+TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model \
 VOCAB_SIZE=1024 \
 MAX_WALLCLOCK_SECONDS=600 \
 TRAIN_LOG_EVERY=50 \
 VAL_LOSS_EVERY=200 \
-torchrun --standalone --nproc_per_node=8 /root/code/parameter-golf/train_gpt.py
+torchrun --standalone --nproc_per_node=8 ./records/track_10min_16mb/2026-03-19_NorMuon+SelectiveQuant/train_gpt.py
+```
+
+Command:
+```bash
+NCCL_IB_DISABLE=1 \
+RUN_ID=verify_sp8192_w6e8_8gpu \
+DATA_PATH=./data/datasets/fineweb10B_sp8192 \
+TOKENIZER_PATH=./data/tokenizers/fineweb_8192_bpe.model \
+VOCAB_SIZE=8192 \
+MAX_WALLCLOCK_SECONDS=600 \
+WEIGHT_QUANTIZATION_BITS=6 \
+TRAIN_SEQ_LEN=2048 \
+EMBED_QUANTIZATION_BITS=8 \
+WARMDOWN_ITERS=3000 \
+torchrun --standalone --nproc_per_node=8 ./records/track_10min_16mb/2026-03-19_NorMuon+SelectiveQuant/train_gpt.py
 ```
 
 Key metrics (from `train.log`):

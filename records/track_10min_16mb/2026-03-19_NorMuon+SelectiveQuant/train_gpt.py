@@ -1,7 +1,7 @@
 """
 The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching-off points for new participants, not SOTA configs. We'll accept PRs that tune, improve, or simplify these scripts without significantly increasing complexity, but competitive submissions should stay in the `/records` folder.
 
-Hard stop: `train_gpt.py` and `train_gpt_mlx.py` must never be longer than 1500 lines.
+Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `train_gpt_mlx.py` never are longer than 1500 lines.
 """
 
 from __future__ import annotations
@@ -79,17 +79,15 @@ class Hyperparameters:
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_beta2 = float(os.environ.get("MUON_BETA2", 0.95))
+    muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
-    muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 1500))
+    muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-    compression_bits = int(os.environ.get("COMPRESSION_BITS", 8))
-    weight_compression_bits = int(os.environ.get("WEIGHT_COMPRESSION_BITS", compression_bits))
-    embed_compression_bits = int(os.environ.get("EMBED_COMPRESSION_BITS", compression_bits))
-    use_qat = bool(int(os.environ.get("USE_QAT", "0")))
-    qat_start_step = int(os.environ.get("QAT_START_STEP", 0))
+    weight_quantization_bits = int(os.environ.get("WEIGHT_QUANTIZATION_BITS", 8))
+    embed_quantization_bits = int(os.environ.get("EMBED_QUANTIZATION_BITS", weight_quantization_bits))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -114,12 +112,19 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
     return X.T if transposed else X
 
 
-
-def normuon_update(grad, momentum, second_momentum, beta=0.95, beta2=0.95, ns_steps=5, nesterov=True):
+def normuon_update(
+    grad: Tensor,
+    momentum: Tensor,
+    second_momentum: Tensor,
+    beta: float = 0.95,
+    beta2: float = 0.95,
+    ns_steps: int = 5,
+    nesterov: bool = True,
+) -> Tensor:
     momentum.lerp_(grad, 1 - beta)
     update = grad.lerp_(momentum, beta) if nesterov else momentum
     original_shape = None
-    if update.ndim == 4:  # for the case of conv filters
+    if update.ndim == 4:
         original_shape = update.shape
         update = update.reshape(update.size(0), -1)
     update = zeropower_via_newtonschulz5(update, steps=ns_steps)
@@ -127,30 +132,40 @@ def normuon_update(grad, momentum, second_momentum, beta=0.95, beta2=0.95, ns_st
 
     if original_shape is not None:
         update = update.reshape(original_shape)
-    ################ NorMuon added ###################
-    vnorm = update.norm(dim=(-2,-1), keepdim=True)
+    vnorm = update.norm(dim=(-2, -1), keepdim=True)
     v_mean = torch.mean(update * update, dim=-1, keepdim=True)
     second_momentum.lerp_(v_mean, 1 - beta2)
     step_size = 1 / second_momentum.sqrt().add_(1e-10)
     update.mul_(step_size)
-    vnorm_new = update.norm(dim=(-2,-1), keepdim=True)
-    update.mul_(vnorm / (vnorm_new.add_(1e-10))) # This scaling keep the update norm the same as pre-normalization
-    ##################################################
-    update *= max(1, grad.size(-2) / grad.size(-1))**0.5
+    vnorm_new = update.norm(dim=(-2, -1), keepdim=True)
+    update.mul_(vnorm / (vnorm_new.add_(1e-10)))
+    update *= max(1, grad.size(-2) / grad.size(-1)) ** 0.5
     return update
 
 
-# modified from https://github.com/KellerJordan/Muon/blob/master/muon.py
 class NorMuon(torch.optim.Optimizer):
-    def __init__(self, params, lr=0.02, weight_decay=0, momentum=0.95, beta2=0.95):
-        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum, beta2=beta2)
+    def __init__(
+        self,
+        params,
+        lr: float = 0.02,
+        weight_decay: float = 0.0,
+        momentum: float = 0.95,
+        beta2: float = 0.95,
+        backend_steps: int = 5,
+    ):
+        defaults = dict(
+            lr=lr,
+            weight_decay=weight_decay,
+            momentum=momentum,
+            beta2=beta2,
+            backend_steps=backend_steps,
+        )
         assert isinstance(params, list) and len(params) >= 1 and isinstance(params[0], torch.nn.Parameter)
         params = sorted(params, key=lambda x: x.size(), reverse=True)
         super().__init__(params, defaults)
 
     @torch.no_grad()
     def step(self, closure=None):
-
         loss = None
         if closure is not None:
             with torch.enable_grad():
@@ -171,21 +186,26 @@ class NorMuon(torch.optim.Optimizer):
                     p = params[base_i + rank]
                     had_grad = p.grad is not None
                     if not had_grad:
-                        # continue
-                        p.grad = torch.zeros_like(p)  # Force synchronization
+                        p.grad = torch.zeros_like(p)
                     state = self.state[p]
                     if len(state) == 0:
                         state["momentum_buffer"] = torch.zeros_like(p)
                         state["second_momentum_buffer"] = torch.zeros_like(p[..., 0:1])
-                    update = normuon_update(p.grad, state["momentum_buffer"], state["second_momentum_buffer"], beta=group["momentum"], beta2=group["beta2"])
+                    update = normuon_update(
+                        p.grad,
+                        state["momentum_buffer"],
+                        state["second_momentum_buffer"],
+                        beta=group["momentum"],
+                        beta2=group["beta2"],
+                        ns_steps=group["backend_steps"],
+                    )
                     if group["weight_decay"] and had_grad:
                         p.mul_(1 - group["lr"] * group["weight_decay"])
                     p.add_(update.reshape(p.shape), alpha=-group["lr"])
                 if distributed:
-                    dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
+                    dist.all_gather(params_pad[base_i : base_i + world_size], params_pad[base_i + rank])
 
         return loss
-
 
 
 # -----------------------------
@@ -326,41 +346,36 @@ INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
-SUPPORTED_COMPRESSION_BITS = {4, 5, 6, 7, 8}
-SUPPORTED_EMBED_COMPRESSION_BITS = SUPPORTED_COMPRESSION_BITS | {16}
-ACTIVE_QAT_WEIGHT_BITS: int | None = None
-ACTIVE_QAT_EMBED_BITS: int | None = None
+SUPPORTED_WEIGHT_QUANTIZATION_BITS = {4, 5, 6, 7, 8}
+SUPPORTED_EMBED_QUANTIZATION_BITS = SUPPORTED_WEIGHT_QUANTIZATION_BITS | {16}
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
 
-def validate_compression_bits(num_bits: int) -> None:
-    if num_bits not in SUPPORTED_COMPRESSION_BITS:
+
+def validate_weight_quantization_bits(num_bits: int) -> None:
+    if num_bits not in SUPPORTED_WEIGHT_QUANTIZATION_BITS:
         raise ValueError(
-            f"COMPRESSION_BITS must be one of {sorted(SUPPORTED_COMPRESSION_BITS)}, got {num_bits}"
+            "WEIGHT_QUANTIZATION_BITS must be one of "
+            f"{sorted(SUPPORTED_WEIGHT_QUANTIZATION_BITS)}, got {num_bits}"
         )
 
-def validate_embed_compression_bits(num_bits: int) -> None:
-    if num_bits not in SUPPORTED_EMBED_COMPRESSION_BITS:
+
+def validate_embed_quantization_bits(num_bits: int) -> None:
+    if num_bits not in SUPPORTED_EMBED_QUANTIZATION_BITS:
         raise ValueError(
-            "EMBED_COMPRESSION_BITS must be one of "
-            f"{sorted(SUPPORTED_EMBED_COMPRESSION_BITS)}, got {num_bits}"
+            "EMBED_QUANTIZATION_BITS must be one of "
+            f"{sorted(SUPPORTED_EMBED_QUANTIZATION_BITS)}, got {num_bits}"
         )
+
 
 def quant_qmax(num_bits: int) -> int:
-    validate_compression_bits(num_bits)
+    validate_weight_quantization_bits(num_bits)
     return (1 << (num_bits - 1)) - 1
 
-def set_active_qat_bits(weight_bits: int | None, embed_bits: int | None) -> None:
-    global ACTIVE_QAT_WEIGHT_BITS, ACTIVE_QAT_EMBED_BITS
-    ACTIVE_QAT_WEIGHT_BITS = weight_bits
-    ACTIVE_QAT_EMBED_BITS = embed_bits
 
 def compression_bits_for_tensor(name: str, weight_bits: int, embed_bits: int) -> int:
     return embed_bits if name == "tok_emb.weight" else weight_bits
-
-def should_fake_quantize_tensor(t: Tensor) -> bool:
-    return t.is_floating_point() and t.numel() > INT8_KEEP_FLOAT_MAX_NUMEL
 
 def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, str]) -> Tensor:
     if any(pattern in name for pattern in INT8_KEEP_FLOAT_FP32_NAME_PATTERNS):
@@ -392,6 +407,7 @@ def quantize_float_tensor(t: Tensor, num_bits: int) -> tuple[Tensor, Tensor]:
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -qmax, qmax).to(torch.int8).contiguous()
     return q, scale
 
+
 def dequantize_float_tensor(q: Tensor, s: Tensor, dtype: torch.dtype) -> Tensor:
     if s.ndim > 0:
         s = s.to(dtype=torch.float32)
@@ -399,8 +415,9 @@ def dequantize_float_tensor(q: Tensor, s: Tensor, dtype: torch.dtype) -> Tensor:
     scale = float(s.item())
     return (q.float() * scale).to(dtype=dtype).contiguous()
 
+
 def pack_lowbit_tensor(q: Tensor, num_bits: int) -> Tensor:
-    validate_compression_bits(num_bits)
+    validate_weight_quantization_bits(num_bits)
     if num_bits >= 8:
         return q.to(torch.int8).contiguous()
     flat = q.contiguous().view(-1).to(torch.int64)
@@ -422,8 +439,9 @@ def pack_lowbit_tensor(q: Tensor, num_bits: int) -> Tensor:
 
     return packed[:total_bytes].to(torch.uint8).contiguous()
 
+
 def unpack_lowbit_tensor(packed: Tensor, shape: tuple[int, ...], num_bits: int) -> Tensor:
-    validate_compression_bits(num_bits)
+    validate_weight_quantization_bits(num_bits)
     if num_bits >= 8:
         return packed.to(torch.int8).view(shape).contiguous()
     flat = packed.contiguous().view(-1).to(torch.int64)
@@ -439,17 +457,6 @@ def unpack_lowbit_tensor(packed: Tensor, shape: tuple[int, ...], num_bits: int) 
     signed = torch.where(encoded >= sign_bit, encoded - (1 << num_bits), encoded)
     return signed.to(torch.int8).view(shape).contiguous()
 
-def fake_quantize_tensor(t: Tensor, num_bits: int) -> Tensor:
-    if not should_fake_quantize_tensor(t):
-        return t
-    q, s = quantize_float_tensor(t, num_bits)
-    dq = dequantize_float_tensor(q, s, t.dtype)
-    return t + (dq - t).detach()
-
-def maybe_fake_quantize_tensor(t: Tensor, num_bits: int | None) -> Tensor:
-    if num_bits is None or num_bits == 16:
-        return t
-    return fake_quantize_tensor(t, num_bits)
 
 def quantize_state_dict(state_dict: dict[str, Tensor], weight_bits: int, embed_bits: int):
     # Single supported clean-script export format:
@@ -457,8 +464,8 @@ def quantize_state_dict(state_dict: dict[str, Tensor], weight_bits: int, embed_b
     # - per-tensor signed quantization for other float tensors
     # - exact passthrough for non-floats
     # - passthrough for small float tensors, stored as fp16 to save bytes
-    validate_compression_bits(weight_bits)
-    validate_embed_compression_bits(embed_bits)
+    validate_weight_quantization_bits(weight_bits)
+    validate_embed_quantization_bits(embed_bits)
     quantized: dict[str, Tensor] = {}
     scales: dict[str, Tensor] = {}
     dtypes: dict[str, str] = {}
@@ -509,7 +516,7 @@ def quantize_state_dict(state_dict: dict[str, Tensor], weight_bits: int, embed_b
         stats["int8_payload_bytes"] += tensor_nbytes(quantized[name]) + tensor_nbytes(s)
 
     obj: dict[str, object] = {
-        "__quant_format__": f"w{weight_bits}_e{embed_bits}_clean_per_row_v3",
+        "__quant_format__": f"w{weight_bits}_e{embed_bits}_clean_per_row_v1",
         "quantized": quantized,
         "scales": scales,
         "dtypes": dtypes,
@@ -521,13 +528,14 @@ def quantize_state_dict(state_dict: dict[str, Tensor], weight_bits: int, embed_b
         obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
     return obj, stats
 
+
 def dequantize_state_dict(obj: dict[str, object]) -> dict[str, Tensor]:
     out: dict[str, Tensor] = {}
     qmeta = obj.get("qmeta", {})
     passthrough_orig_dtypes = obj.get("passthrough_orig_dtypes", {})
     for name, stored_q in obj["quantized"].items():
-        meta = qmeta.get(name, {})
         dtype = getattr(torch, obj["dtypes"][name])
+        meta = qmeta.get(name, {})
         s = obj["scales"][name]
         if meta.get("packed"):
             shape = tuple(int(dim) for dim in meta["shape"])
@@ -633,8 +641,7 @@ class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
     def forward(self, x: Tensor) -> Tensor:
         bias = self.bias.to(x.dtype) if self.bias is not None else None
-        weight = maybe_fake_quantize_tensor(self.weight, ACTIVE_QAT_WEIGHT_BITS)
-        return F.linear(x, weight.to(x.dtype), bias)
+        return F.linear(x, self.weight.to(x.dtype), bias)
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -822,12 +829,10 @@ class GPT(nn.Module):
                 nn.init.zeros_(module.weight)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        tok_emb_weight = maybe_fake_quantize_tensor(self.tok_emb.weight, ACTIVE_QAT_EMBED_BITS)
-        x = F.embedding(input_ids, tok_emb_weight)
+        x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
-        skip_weights = maybe_fake_quantize_tensor(self.skip_weights, ACTIVE_QAT_WEIGHT_BITS)
 
         # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
@@ -835,13 +840,13 @@ class GPT(nn.Module):
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
-                x = x + skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
-            logits_proj = F.linear(x, tok_emb_weight)
+            logits_proj = F.linear(x, self.tok_emb.weight)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
@@ -859,11 +864,8 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    validate_compression_bits(args.compression_bits)
-    validate_compression_bits(args.weight_compression_bits)
-    validate_embed_compression_bits(args.embed_compression_bits)
-    if args.qat_start_step < 0:
-        raise ValueError(f"QAT_START_STEP must be non-negative, got {args.qat_start_step}")
+    validate_weight_quantization_bits(args.weight_quantization_bits)
+    validate_embed_quantization_bits(args.embed_quantization_bits)
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -888,97 +890,6 @@ def main() -> None:
         dist.init_process_group(backend="nccl", device_id=device)
         dist.barrier()
     master_process = rank == 0
-
-    # Optional W&B logging (rank 0 only).
-    # Enable with either:
-    # - `USE_WANDB=1` (plus `WANDB_PROJECT`), or
-    # - setting `WANDB_PROJECT` directly.
-    wandb_run = None
-    use_wandb = os.environ.get("WANDB_PROJECT") or os.environ.get("USE_WANDB", "0") == "1"
-    if master_process and use_wandb:
-        import wandb  # type: ignore
-
-        def cast_like(example: object, value: object) -> object:
-            # W&B sweeps may send numeric values back as floats.
-            if isinstance(example, bool):
-                if isinstance(value, str):
-                    return value.lower() in {"1", "true", "yes", "y"}
-                return bool(int(value)) if isinstance(value, (int, float)) else bool(value)
-            if isinstance(example, int) and not isinstance(example, bool):
-                return int(value)
-            if isinstance(example, float):
-                return float(value)
-            return value
-
-        wandb_config = {
-            # Data / tokenizer
-            "data_path": args.data_path,
-            "tokenizer_path": args.tokenizer_path,
-            "vocab_size": args.vocab_size,
-            # Seeds
-            "seed": args.seed,
-            # Validation + logging
-            "val_batch_size": args.val_batch_size,
-            "val_loss_every": args.val_loss_every,
-            "train_log_every": args.train_log_every,
-            # Training length + batching
-            "iterations": args.iterations,
-            "warmdown_iters": args.warmdown_iters,
-            "warmup_steps": args.warmup_steps,
-            "train_batch_tokens": args.train_batch_tokens,
-            "train_seq_len": args.train_seq_len,
-            "max_wallclock_seconds": args.max_wallclock_seconds,
-            "qk_gain_init": args.qk_gain_init,
-            # Model shape
-            "num_layers": args.num_layers,
-            "model_dim": args.model_dim,
-            "num_heads": args.num_heads,
-            "num_kv_heads": args.num_kv_heads,
-            "mlp_mult": args.mlp_mult,
-            "tie_embeddings": args.tie_embeddings,
-            "rope_base": args.rope_base,
-            "logit_softcap": args.logit_softcap,
-            # Optimizer knobs
-            "embed_lr": args.embed_lr,
-            "head_lr": args.head_lr,
-            "tied_embed_lr": args.tied_embed_lr,
-            "tied_embed_init_std": args.tied_embed_init_std,
-            "matrix_lr": args.matrix_lr,
-            "scalar_lr": args.scalar_lr,
-            "muon_momentum": args.muon_momentum,
-            "muon_beta2": args.muon_beta2,
-            "muon_momentum_warmup_start": args.muon_momentum_warmup_start,
-            "muon_momentum_warmup_steps": args.muon_momentum_warmup_steps,
-            "beta1": args.beta1,
-            "beta2": args.beta2,
-            "adam_eps": args.adam_eps,
-            "grad_clip_norm": args.grad_clip_norm,
-            "compression_bits": args.compression_bits,
-            "weight_compression_bits": args.weight_compression_bits,
-            "embed_compression_bits": args.embed_compression_bits,
-            "use_qat": args.use_qat,
-            "qat_start_step": args.qat_start_step,
-            # Run identity
-            "run_id": args.run_id,
-        }
-
-        wandb_run = wandb.init(
-            project=os.environ.get("WANDB_PROJECT", "parameter-golf"),
-            entity=os.environ.get("WANDB_ENTITY"),
-            name=args.run_id,
-            id=args.run_id,
-            resume="allow",
-            config=wandb_config,
-        )
-
-        # Apply sweep overrides from `wandb.config` onto our env-derived defaults.
-        for key, value in dict(wandb_run.config).items():
-            if hasattr(args, key):
-                setattr(args, key, cast_like(getattr(args, key), value))
-
-        # Recompute derived file globs if data_path was overridden.
-        args.train_files = os.path.join(args.data_path, "fineweb_train_*.bin")
-        args.val_files = os.path.join(args.data_path, "fineweb_val_*.bin")
 
     # Fast math knobs
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -1095,6 +1006,7 @@ def main() -> None:
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         beta2=args.muon_beta2,
+        backend_steps=args.muon_backend_steps,
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
@@ -1131,9 +1043,8 @@ def main() -> None:
     )
     log0(f"seed:{args.seed}")
     log0(
-        f"compression_bits:{args.compression_bits} weight_compression_bits:{args.weight_compression_bits} "
-        f"embed_compression_bits:{args.embed_compression_bits} use_qat:{int(args.use_qat)} "
-        f"qat_start_step:{args.qat_start_step}"
+        f"weight_quantization_bits:{args.weight_quantization_bits} "
+        f"embed_quantization_bits:{args.embed_quantization_bits} muon_beta2:{args.muon_beta2}"
     )
 
     # -----------------------------
@@ -1161,10 +1072,6 @@ def main() -> None:
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
-    set_active_qat_bits(
-        args.weight_compression_bits if args.use_qat and args.qat_start_step == 0 else None,
-        args.embed_compression_bits if args.use_qat and args.qat_start_step == 0 else None,
-    )
     if args.warmup_steps > 0:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
@@ -1202,10 +1109,6 @@ def main() -> None:
 
     step = 0
     while True:
-        set_active_qat_bits(
-            args.weight_compression_bits if args.use_qat and step >= args.qat_start_step else None,
-            args.embed_compression_bits if args.use_qat and step >= args.qat_start_step else None,
-        )
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
         should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
@@ -1228,11 +1131,6 @@ def main() -> None:
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
-            if wandb_run is not None:
-                wandb_run.log(
-                    {"val_loss": val_loss, "val_bpb": val_bpb, "train_time_ms": training_time_ms},
-                    step=step,
-                )
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
@@ -1284,11 +1182,6 @@ def main() -> None:
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
-            if wandb_run is not None:
-                wandb_run.log(
-                    {"train_loss": float(train_loss.item()), "train_time_ms": approx_training_time_ms, "lr_scale": float(scale)},
-                    step=step,
-                )
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
@@ -1308,8 +1201,7 @@ def main() -> None:
     # SERIALIZATION + ROUNDTRIP VALIDATION
     # -----------------------------
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
-    # the compressed low-bit+zlib artifact and validate the round-tripped weights.
-    set_active_qat_bits(None, None)
+    # the compressed quantized+zlib artifact and validate the round-tripped weights.
 
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")
@@ -1321,8 +1213,8 @@ def main() -> None:
 
     quant_obj, quant_stats = quantize_state_dict(
         base_model.state_dict(),
-        args.weight_compression_bits,
-        args.embed_compression_bits,
+        args.weight_quantization_bits,
+        args.embed_quantization_bits,
     )
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
@@ -1330,9 +1222,9 @@ def main() -> None:
     quant_blob = zlib.compress(quant_raw, level=9)
     quant_raw_bytes = len(quant_raw)
     quant_tag = (
-        f"int{args.weight_compression_bits}"
-        if args.weight_compression_bits == args.embed_compression_bits
-        else f"w{args.weight_compression_bits}e{args.embed_compression_bits}"
+        f"int{args.weight_quantization_bits}"
+        if args.weight_quantization_bits == args.embed_quantization_bits
+        else f"w{args.weight_quantization_bits}e{args.embed_quantization_bits}"
     )
     quantized_model_path = f"final_model.{quant_tag}.ptz"
     if master_process:
@@ -1372,25 +1264,7 @@ def main() -> None:
         f"final_{quant_tag}_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
-    log0(
-        f"final_{quant_tag}_zlib_roundtrip_exact "
-        f"val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}"
-    )
-
-    if master_process and wandb_run is not None:
-        wandb_run.log(
-            {
-                "final_roundtrip_val_loss": q_val_loss,
-                "final_roundtrip_val_bpb": q_val_bpb,
-                "final_quantized_size": quant_file_bytes,
-                "final_total_submission_size": quant_file_bytes + code_bytes,
-                "compression_bits": args.compression_bits,
-                "weight_compression_bits": args.weight_compression_bits,
-                "embed_compression_bits": args.embed_compression_bits,
-            },
-            step=step,
-        )
-        wandb_run.finish()
+    log0(f"final_{quant_tag}_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
     if distributed:
         dist.destroy_process_group()
