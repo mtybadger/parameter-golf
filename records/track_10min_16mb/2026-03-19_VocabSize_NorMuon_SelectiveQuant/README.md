@@ -33,7 +33,7 @@ MAX_WALLCLOCK_SECONDS=600 \
 WEIGHT_QUANTIZATION_BITS=6 \
 EMBED_QUANTIZATION_BITS=8 \
 WARMDOWN_ITERS=3000 \
-TRAIN_SEQ_LEN=2048 \
+TRAIN_SEQ_LEN=4096 \
 NUM_LAYERS=8 \
 torchrun --standalone --nproc_per_node=8 ./records/track_10min_16mb/2026-03-19_VocabSize_NorMuon_SelectiveQuant/train_gpt.py
 ```
