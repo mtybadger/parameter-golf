@@ -1,7 +1,7 @@
 """
 The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching-off points for new participants, not SOTA configs. We'll accept PRs that tune, improve, or simplify these scripts without significantly increasing complexity, but competitive submissions should stay in the `/records` folder.
 
-Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `train_gpt_mlx.py` never are longer than 1500 lines.
+Hard stop: `train_gpt.py` and `train_gpt_mlx.py` must never be longer than 1500 lines.
 """
 
 from __future__ import annotations
@@ -9,7 +9,6 @@ from __future__ import annotations
 import copy
 import glob
 import io
-import json
 import math
 import os
 import random
@@ -60,13 +59,9 @@ class Hyperparameters:
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
-    # Model shape. `NUM_LAYERS` is kept as a compatibility fallback for the
-    # non-recursive case where `NUM_RECURRENCE=1`.
+    # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
-    num_unique_layers = int(os.environ.get("NUM_UNIQUE_LAYERS", num_layers))
-    recurrent_layers = os.environ.get("RECURRENT_LAYERS", "").strip()
-    num_recurrence = int(os.environ.get("NUM_RECURRENCE", 1))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -74,9 +69,6 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
-    use_recurrence_scales = bool(int(os.environ.get("USE_RECURRENCE_SCALES", "1")))
-    use_rrt_lora = bool(int(os.environ.get("USE_RRT_LORA", "1")))
-    lora_rank = int(os.environ.get("LORA_RANK", 16))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -86,7 +78,7 @@ class Hyperparameters:
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
-    muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
+    muon_beta2 = float(os.environ.get("MUON_BETA2", 0.95))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
@@ -117,15 +109,43 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
     return X.T if transposed else X
 
 
-class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
-        super().__init__(
-            params,
-            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
-        )
+
+def normuon_update(grad, momentum, second_momentum, beta=0.95, beta2=0.95, ns_steps=5, nesterov=True):
+    momentum.lerp_(grad, 1 - beta)
+    update = grad.lerp_(momentum, beta) if nesterov else momentum
+    original_shape = None
+    if update.ndim == 4:  # for the case of conv filters
+        original_shape = update.shape
+        update = update.reshape(update.size(0), -1)
+    update = zeropower_via_newtonschulz5(update, steps=ns_steps)
+    update = update.to(grad.dtype)
+
+    if original_shape is not None:
+        update = update.reshape(original_shape)
+    ################ NorMuon added ###################
+    vnorm = update.norm(dim=(-2,-1), keepdim=True)
+    v_mean = torch.mean(update * update, dim=-1, keepdim=True)
+    second_momentum.lerp_(v_mean, 1 - beta2)
+    step_size = 1 / second_momentum.sqrt().add_(1e-10)
+    update.mul_(step_size)
+    vnorm_new = update.norm(dim=(-2,-1), keepdim=True)
+    update.mul_(vnorm / (vnorm_new.add_(1e-10))) # This scaling keep the update norm the same as pre-normalization
+    ##################################################
+    update *= max(1, grad.size(-2) / grad.size(-1))**0.5
+    return update
+
+
+# modified from https://github.com/KellerJordan/Muon/blob/master/muon.py
+class NorMuon(torch.optim.Optimizer):
+    def __init__(self, params, lr=0.02, weight_decay=0, momentum=0.95, beta2=0.95):
+        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum, beta2=beta2)
+        assert isinstance(params, list) and len(params) >= 1 and isinstance(params[0], torch.nn.Parameter)
+        params = sorted(params, key=lambda x: x.size(), reverse=True)
+        super().__init__(params, defaults)
 
     @torch.no_grad()
     def step(self, closure=None):
+
         loss = None
         if closure is not None:
             with torch.enable_grad():
@@ -139,41 +159,28 @@ class Muon(torch.optim.Optimizer):
             params = group["params"]
             if not params:
                 continue
-            lr = group["lr"]
-            momentum = group["momentum"]
-            backend_steps = group["backend_steps"]
-            nesterov = group["nesterov"]
-
-            total_params = sum(int(p.numel()) for p in params)
-            updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
-
-            curr = 0
-            for i, p in enumerate(params):
-                if i % world_size == rank and p.grad is not None:
-                    g = p.grad
+            pad_count = (-len(params)) % world_size
+            params_pad = params + [torch.empty_like(params[-1]) for _ in range(pad_count)]
+            for base_i in range(0, len(params_pad), world_size):
+                if base_i + rank < len(params):
+                    p = params[base_i + rank]
+                    had_grad = p.grad is not None
+                    if not had_grad:
+                        # continue
+                        p.grad = torch.zeros_like(p)  # Force synchronization
                     state = self.state[p]
-                    if "momentum_buffer" not in state:
-                        state["momentum_buffer"] = torch.zeros_like(g)
-                    buf = state["momentum_buffer"]
-                    buf.mul_(momentum).add_(g)
-                    if nesterov:
-                        g = g.add(buf, alpha=momentum)
-                    g = zeropower_via_newtonschulz5(g, steps=backend_steps)
-                    # Scale correction from Muon reference implementations.
-                    g *= max(1, g.size(0) / g.size(1)) ** 0.5
-                    updates_flat[curr : curr + p.numel()] = g.reshape(-1)
-                curr += p.numel()
-
-            if distributed:
-                dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
-
-            curr = 0
-            for p in params:
-                g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
-                p.add_(g, alpha=-lr)
-                curr += p.numel()
+                    if len(state) == 0:
+                        state["momentum_buffer"] = torch.zeros_like(p)
+                        state["second_momentum_buffer"] = torch.zeros_like(p[..., 0:1])
+                    update = normuon_update(p.grad, state["momentum_buffer"], state["second_momentum_buffer"], beta=group["momentum"], beta2=group["beta2"])
+                    if group["weight_decay"] and had_grad:
+                        p.mul_(1 - group["lr"] * group["weight_decay"])
+                    p.add_(update.reshape(p.shape), alpha=-group["lr"])
+                if distributed:
+                    dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
 
         return loss
+
 
 
 # -----------------------------
@@ -297,7 +304,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,recurrence_scale,recurrence_scales",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
     ).split(",")
     if pattern
 )
@@ -378,7 +385,7 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
 
         # Small float tensors are cheap enough to keep directly. We still downcast
         # fp32/bf16 passthrough tensors to fp16 so metadata does not dominate size.
-        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
+        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL or name == "tok_emb.weight":
             kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
             passthrough[name] = kept
             stats["int8_payload_bytes"] += tensor_nbytes(kept)
@@ -521,17 +528,6 @@ class CastedLinear(nn.Linear):
         return F.linear(x, self.weight.to(x.dtype), bias)
 
 
-class LoRAAdapter(nn.Module):
-    def __init__(self, in_dim: int, out_dim: int, rank: int):
-        super().__init__()
-        self.down = CastedLinear(in_dim, rank, bias=False)
-        self.up = CastedLinear(rank, out_dim, bias=False)
-        nn.init.zeros_(self.up.weight)
-
-    def forward(self, x: Tensor) -> Tensor:
-        return self.up(self.down(x))
-
-
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
     # Keep small/control parameters in fp32 even when the model body runs in bf16.
     with torch.no_grad():
@@ -599,18 +595,11 @@ class CausalSelfAttention(nn.Module):
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
-    def forward(self, x: Tensor, lora: "LoRASet | None" = None) -> Tensor:
+    def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
-        q = self.c_q(x)
-        k = self.c_k(x)
-        v = self.c_v(x)
-        if lora is not None:
-            q = q + lora.q(x)
-            k = k + lora.k(x)
-            v = v + lora.v(x)
-        q = q.reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = v.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
@@ -626,10 +615,7 @@ class CausalSelfAttention(nn.Module):
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
-        out = self.proj(y)
-        if lora is not None:
-            out = out + lora.o(y)
-        return out
+        return self.proj(y)
 
 
 class MLP(nn.Module):
@@ -644,17 +630,6 @@ class MLP(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         x = torch.relu(self.fc(x))
         return self.proj(x.square())
-
-
-class LoRASet(nn.Module):
-    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rank: int):
-        super().__init__()
-        head_dim = dim // num_heads
-        kv_dim = num_kv_heads * head_dim
-        self.q = LoRAAdapter(dim, dim, rank)
-        self.k = LoRAAdapter(dim, kv_dim, rank)
-        self.v = LoRAAdapter(dim, kv_dim, rank)
-        self.o = LoRAAdapter(dim, dim, rank)
 
 
 class Block(nn.Module):
@@ -676,10 +651,10 @@ class Block(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-    def forward(self, x: Tensor, x0: Tensor, lora: "LoRASet | None" = None) -> Tensor:
+    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x), lora=lora)
+        attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
@@ -689,8 +664,7 @@ class GPT(nn.Module):
     def __init__(
         self,
         vocab_size: int,
-        num_unique_layers: int,
-        recurrent_layers: list[int],
+        num_layers: int,
         model_dim: int,
         num_heads: int,
         num_kv_heads: int,
@@ -698,43 +672,18 @@ class GPT(nn.Module):
         tie_embeddings: bool,
         tied_embed_init_std: float,
         logit_softcap: float,
-        use_recurrence_scales: bool,
         rope_base: float,
         qk_gain_init: float,
-        use_rrt_lora: bool,
-        lora_rank: int,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
-        if num_unique_layers <= 0:
-            raise ValueError(f"num_unique_layers must be positive, got {num_unique_layers}")
-        if len(recurrent_layers) != num_unique_layers:
-            raise ValueError(
-                f"recurrent_layers must have length {num_unique_layers}, got {len(recurrent_layers)}"
-            )
-        if any(count < 0 for count in recurrent_layers):
-            raise ValueError(f"recurrent_layers must be non-negative, got {recurrent_layers}")
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
-        self.num_unique_layers = num_unique_layers
-        self.recurrent_layers = tuple(int(count) for count in recurrent_layers)
-        self.use_recurrence_scales = use_recurrence_scales
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        execution_block_indices: list[int] = []
-        execution_loop_indices: list[int] = []
-        for block_idx, extra_repeats in enumerate(self.recurrent_layers):
-            execution_block_indices.append(block_idx)
-            execution_loop_indices.append(0)
-            for repeat_idx in range(extra_repeats):
-                execution_block_indices.append(block_idx)
-                execution_loop_indices.append(repeat_idx + 1)
-        self.execution_block_indices = tuple(execution_block_indices)
-        self.execution_loop_indices = tuple(execution_loop_indices)
-        effective_layers = len(self.execution_block_indices)
-        self.num_encoder_layers = effective_layers // 2
-        self.num_decoder_layers = effective_layers - self.num_encoder_layers
+        self.num_encoder_layers = num_layers // 2
+        self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList(
@@ -747,17 +696,9 @@ class GPT(nn.Module):
                     rope_base,
                     qk_gain_init,
                 )
-                for _ in range(num_unique_layers)
+                for i in range(num_layers)
             ]
         )
-        max_extra_repeats = max(self.recurrent_layers, default=0)
-        if use_rrt_lora and lora_rank > 0 and max_extra_repeats > 0:
-            self.lora_sets = nn.ModuleList(
-                [LoRASet(model_dim, num_heads, num_kv_heads, lora_rank) for _ in range(max_extra_repeats)]
-            )
-        else:
-            self.lora_sets = nn.ModuleList()
-        self.recurrence_scales = nn.Parameter(torch.ones(effective_layers, model_dim, dtype=torch.float32))
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -776,24 +717,15 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
-        effective_layers = len(self.execution_block_indices)
-        skip_idx = 0
 
-        for effective_idx, (block_idx, loop_idx) in enumerate(
-            zip(self.execution_block_indices, self.execution_loop_indices, strict=True)
-        ):
-            if self.use_recurrence_scales:
-                x = x * self.recurrence_scales[effective_idx].to(dtype=x.dtype)[None, None, :]
-            lora = self.lora_sets[loop_idx - 1] if loop_idx > 0 and self.lora_sets else None
-            if effective_idx < self.num_encoder_layers:
-                x = self.blocks[block_idx](x, x0, lora=lora)
-                skips.append(x)
-                continue
-            decoder_idx = effective_idx - self.num_encoder_layers
-            if decoder_idx < len(skips):
-                x = x + self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :] * skips[len(skips) - 1 - decoder_idx]
-                skip_idx += 1
-            x = self.blocks[block_idx](x, x0, lora=lora)
+        # First half stores skips; second half reuses them in reverse order.
+        for i in range(self.num_encoder_layers):
+            x = self.blocks[i](x, x0)
+            skips.append(x)
+        for i in range(self.num_decoder_layers):
+            if skips:
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            x = self.blocks[self.num_encoder_layers + i](x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -810,31 +742,6 @@ class GPT(nn.Module):
 # -----------------------------
 # TRAINING
 # -----------------------------
-
-def build_recurrent_layers(args: Hyperparameters) -> list[int]:
-    if args.recurrent_layers:
-        if isinstance(args.recurrent_layers, list):
-            parsed = args.recurrent_layers
-        else:
-            try:
-                parsed = json.loads(args.recurrent_layers)
-            except json.JSONDecodeError as e:
-                raise ValueError(
-                    f"RECURRENT_LAYERS must be valid JSON like [0,4,0], got {args.recurrent_layers!r}"
-                ) from e
-        if not isinstance(parsed, list):
-            raise ValueError(f"RECURRENT_LAYERS must decode to a list, got {type(parsed).__name__}")
-        out = [int(v) for v in parsed]
-        if len(out) != args.num_unique_layers:
-            raise ValueError(
-                f"RECURRENT_LAYERS length must match NUM_UNIQUE_LAYERS={args.num_unique_layers}, got {len(out)}"
-            )
-        if any(v < 0 for v in out):
-            raise ValueError(f"RECURRENT_LAYERS must be non-negative, got {out}")
-        return out
-    # Backward-compatible fallback: repeat every layer equally.
-    return [max(args.num_recurrence - 1, 0)] * args.num_unique_layers
-
 
 def main() -> None:
     global zeropower_via_newtonschulz5
@@ -872,12 +779,11 @@ def main() -> None:
     # - setting `WANDB_PROJECT` directly.
     wandb_run = None
     use_wandb = os.environ.get("WANDB_PROJECT") or os.environ.get("USE_WANDB", "0") == "1"
-    recurrent_layers = build_recurrent_layers(args)
     if master_process and use_wandb:
         import wandb  # type: ignore
 
         def cast_like(example: object, value: object) -> object:
-            # W&B sometimes returns numbers as floats even when the sweep expects ints.
+            # W&B sweeps may send numeric values back as floats.
             if isinstance(example, bool):
                 if isinstance(value, str):
                     return value.lower() in {"1", "true", "yes", "y"}
@@ -909,10 +815,6 @@ def main() -> None:
             "qk_gain_init": args.qk_gain_init,
             # Model shape
             "num_layers": args.num_layers,
-            "num_unique_layers": args.num_unique_layers,
-            "num_recurrence": args.num_recurrence,
-            "recurrent_layers": recurrent_layers,
-            "effective_layers": args.num_unique_layers + sum(recurrent_layers),
             "model_dim": args.model_dim,
             "num_heads": args.num_heads,
             "num_kv_heads": args.num_kv_heads,
@@ -920,9 +822,6 @@ def main() -> None:
             "tie_embeddings": args.tie_embeddings,
             "rope_base": args.rope_base,
             "logit_softcap": args.logit_softcap,
-            "use_recurrence_scales": args.use_recurrence_scales,
-            "use_rrt_lora": args.use_rrt_lora,
-            "lora_rank": args.lora_rank,
             # Optimizer knobs
             "embed_lr": args.embed_lr,
             "head_lr": args.head_lr,
@@ -931,7 +830,7 @@ def main() -> None:
             "matrix_lr": args.matrix_lr,
             "scalar_lr": args.scalar_lr,
             "muon_momentum": args.muon_momentum,
-            "muon_backend_steps": args.muon_backend_steps,
+            "muon_beta2": args.muon_beta2,
             "muon_momentum_warmup_start": args.muon_momentum_warmup_start,
             "muon_momentum_warmup_steps": args.muon_momentum_warmup_steps,
             "beta1": args.beta1,
@@ -956,10 +855,9 @@ def main() -> None:
             if hasattr(args, key):
                 setattr(args, key, cast_like(getattr(args, key), value))
 
-        # Recompute derived patterns if data_path was overridden.
+        # Recompute derived file globs if data_path was overridden.
         args.train_files = os.path.join(args.data_path, "fineweb_train_*.bin")
         args.val_files = os.path.join(args.data_path, "fineweb_val_*.bin")
-        recurrent_layers = build_recurrent_layers(args)
 
     # Fast math knobs
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -1028,8 +926,7 @@ def main() -> None:
 
     base_model = GPT(
         vocab_size=args.vocab_size,
-        num_unique_layers=args.num_unique_layers,
-        recurrent_layers=recurrent_layers,
+        num_layers=args.num_layers,
         model_dim=args.model_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
@@ -1037,11 +934,8 @@ def main() -> None:
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
-        use_recurrence_scales=args.use_recurrence_scales,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
-        use_rrt_lora=args.use_rrt_lora,
-        lora_rank=args.lora_rank,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1068,12 +962,6 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
-    if args.use_recurrence_scales:
-        scalar_params.append(base_model.recurrence_scales)
-    if base_model.lora_sets:
-        lora_named_params = list(base_model.lora_sets.named_parameters())
-        matrix_params.extend([p for _, p in lora_named_params if p.ndim == 2])
-        scalar_params.extend([p for _, p in lora_named_params if p.ndim < 2])
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1081,11 +969,11 @@ def main() -> None:
         eps=args.adam_eps,
         fused=True,
     )
-    optimizer_muon = Muon(
+    optimizer_muon = NorMuon(
         matrix_params,
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
-        backend_steps=args.muon_backend_steps,
+        beta2=args.muon_beta2,
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
@@ -1106,11 +994,7 @@ def main() -> None:
         optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
-    effective_layers = args.num_unique_layers + sum(recurrent_layers)
-    log0(
-        f"model_params:{n_params} (effective_layers:{effective_layers} "
-        f"unique_layers:{args.num_unique_layers} recurrent_layers:{recurrent_layers})"
-    )
+    log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")

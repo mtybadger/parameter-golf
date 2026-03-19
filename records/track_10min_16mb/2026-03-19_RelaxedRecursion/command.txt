@@ -1,0 +1,224 @@
+RUN_ID=baseline_sp1024_2 \
+DATA_PATH=./data/datasets/fineweb10B_sp1024/ \
+TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model \
+VOCAB_SIZE=1024 \
+USE_WANDB=1 \
+CUDA_VISIBLE_DEVICES=0 \
+python3 records/track_10min_16mb/2026-03-19_RelaxedRecursion/train_gpt.py
+
+RUN_ID=baseline_sp1024_5 \
+DATA_PATH=./data/datasets/fineweb10B_sp1024/ \
+TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model \
+VOCAB_SIZE=1024 \
+USE_WANDB=1 \
+CUDA_VISIBLE_DEVICES=1 \
+python3 records/track_10min_16mb/2026-03-19_NorMuon/train_gpt.py
+
+RUN_ID=baseline_sp2048 \
+DATA_PATH=./data/datasets/fineweb10B_sp2048/ \
+TOKENIZER_PATH=./data/tokenizers/fineweb_2048_bpe.model \
+VOCAB_SIZE=2048 \
+USE_WANDB=1 \
+CUDA_VISIBLE_DEVICES=2 \
+python3 records/track_10min_16mb/2026-03-19_NorMuon/train_gpt.py
+
+RUN_ID=baseline_sp2048_fastandloose \
+DATA_PATH=./data/datasets/fineweb10B_sp2048/ \
+TOKENIZER_PATH=./data/tokenizers/fineweb_2048_bpe.model \
+VOCAB_SIZE=2048 \
+TRAIN_SEQ_LEN=512 \
+TRAIN_BATCH_TOKENS=1048576 \
+USE_WANDB=1 \
+CUDA_VISIBLE_DEVICES=0 \
+python3 records/track_10min_16mb/2026-03-19_NorMuon/train_gpt.py
+
+RUN_ID=baseline_sp2048_longseq \
+DATA_PATH=./data/datasets/fineweb10B_sp2048/ \
+TOKENIZER_PATH=./data/tokenizers/fineweb_2048_bpe.model \
+VOCAB_SIZE=2048 \
+TRAIN_SEQ_LEN=2048 \
+TRAIN_BATCH_TOKENS=524288
+USE_WANDB=1 \
+CUDA_VISIBLE_DEVICES=1 \
+python3 records/track_10min_16mb/2026-03-19_NorMuon/train_gpt.py
+
+RUN_ID=baseline_sp4096_fastandloose \
+DATA_PATH=./data/datasets/fineweb10B_sp4096/ \
+TOKENIZER_PATH=./data/tokenizers/fineweb_4096_bpe.model \
+VOCAB_SIZE=4096 \
+TRAIN_SEQ_LEN=256 \
+TRAIN_BATCH_TOKENS=4194304 \
+USE_WANDB=1 \
+CUDA_VISIBLE_DEVICES=1 \
+python3 records/track_10min_16mb/2026-03-19_NorMuon/train_gpt.py
+
+RUN_ID=baseline_sp4096 \
+DATA_PATH=./data/datasets/fineweb10B_sp4096/ \
+TOKENIZER_PATH=./data/tokenizers/fineweb_4096_bpe.model \
+VOCAB_SIZE=4096 \
+USE_WANDB=1 \
+CUDA_VISIBLE_DEVICES=0 \
+python3 records/track_10min_16mb/2026-03-19_NorMuon/train_gpt.py
+
+RUN_ID=baseline_sp8192_7layernorm \
+DATA_PATH=./data/datasets/fineweb10B_sp8192/ \
+TOKENIZER_PATH=./data/tokenizers/fineweb_8192_bpe.model \
+VOCAB_SIZE=8192 \
+NUM_LAYERS=7 \
+USE_WANDB=1 \
+CUDA_VISIBLE_DEVICES=0 \
+python3 records/track_10min_16mb/2026-03-19_NorMuon/train_gpt.py
+
+RUN_ID=sp4096_6_2x2_nolora \
+DATA_PATH=./data/datasets/fineweb10B_sp4096/ \
+TOKENIZER_PATH=./data/tokenizers/fineweb_4096_bpe.model \
+VOCAB_SIZE=4096 \
+USE_RRT_LORA=0 \
+USE_RECURRENCE_SCALES=0 \
+USE_WANDB=1 \
+CUDA_VISIBLE_DEVICES=1 \
+NUM_UNIQUE_LAYERS=6 \
+RECURRENT_LAYERS="[0,2,2,2,0,0]" \
+python3 records/track_10min_16mb/2026-03-19_RelaxedRecursion/train_gpt.py
+
+RUN_ID=sp8192_6_3x2_nolora \
+DATA_PATH=./data/datasets/fineweb10B_sp8192/ \
+TOKENIZER_PATH=./data/tokenizers/fineweb_8192_bpe.model \
+VOCAB_SIZE=8192 \
+USE_RRT_LORA=0 \
+USE_RECURRENCE_SCALES=0 \
+USE_WANDB=1 \
+CUDA_VISIBLE_DEVICES=2 \
+NUM_UNIQUE_LAYERS=6 \
+RECURRENT_LAYERS="[0,2,2,2,0,0]" \
+python3 records/track_10min_16mb/2026-03-19_RelaxedRecursion/train_gpt.py
+
+RUN_ID=sp4096_just8layers \
+DATA_PATH=./data/datasets/fineweb10B_sp4096/ \
+TOKENIZER_PATH=./data/tokenizers/fineweb_4096_bpe.model \
+VOCAB_SIZE=4096 \
+USE_RRT_LORA=0 \
+USE_RECURRENCE_SCALES=0 \
+USE_WANDB=1 \
+CUDA_VISIBLE_DEVICES=1 \
+NUM_UNIQUE_LAYERS=8 \
+RECURRENT_LAYERS="[0,0,0,0,0,0,0,0]" \
+python3 records/track_10min_16mb/2026-03-19_RelaxedRecursion/train_gpt.py
+
+RUN_ID=sp8192_just7layers \
+DATA_PATH=./data/datasets/fineweb10B_sp8192/ \
+TOKENIZER_PATH=./data/tokenizers/fineweb_8192_bpe.model \
+VOCAB_SIZE=8192 \
+USE_RRT_LORA=0 \
+USE_RECURRENCE_SCALES=0 \
+USE_WANDB=1 \
+CUDA_VISIBLE_DEVICES=2 \
+NUM_UNIQUE_LAYERS=7 \
+RECURRENT_LAYERS="[0,0,0,0,0,0,0]" \
+python3 records/track_10min_16mb/2026-03-19_RelaxedRecursion/train_gpt.py
+
+RUN_ID=sp8192_just6layers \
+DATA_PATH=./data/datasets/fineweb10B_sp8192/ \
+TOKENIZER_PATH=./data/tokenizers/fineweb_8192_bpe.model \
+VOCAB_SIZE=8192 \
+USE_RRT_LORA=0 \
+USE_RECURRENCE_SCALES=0 \
+USE_WANDB=1 \
+CUDA_VISIBLE_DEVICES=1 \
+NUM_UNIQUE_LAYERS=6 \
+RECURRENT_LAYERS="[0,0,0,0,0,0]" \
+python3 records/track_10min_16mb/2026-03-19_RelaxedRecursion/train_gpt.py
+
+RUN_ID=sp8192_6plus2x2_nolora \
+DATA_PATH=./data/datasets/fineweb10B_sp8192/ \
+TOKENIZER_PATH=./data/tokenizers/fineweb_8192_bpe.model \
+VOCAB_SIZE=8192 \
+USE_RRT_LORA=0 \
+USE_RECURRENCE_SCALES=0 \
+USE_WANDB=1 \
+CUDA_VISIBLE_DEVICES=2 \
+NUM_UNIQUE_LAYERS=6 \
+RECURRENT_LAYERS="[0,0,3,3,0,0]" \
+python3 records/track_10min_16mb/2026-03-19_RelaxedRecursion/train_gpt.py
+
+RUN_ID=sp8192_6plus2x2_lorascaled \
+DATA_PATH=./data/datasets/fineweb10B_sp8192/ \
+TOKENIZER_PATH=./data/tokenizers/fineweb_8192_bpe.model \
+VOCAB_SIZE=8192 \
+USE_RRT_LORA=1 \
+USE_RECURRENCE_SCALES=1 \
+USE_WANDB=1 \
+CUDA_VISIBLE_DEVICES=0 \
+NUM_UNIQUE_LAYERS=6 \
+RECURRENT_LAYERS="[0,0,3,3,0,0]" \
+python3 records/track_10min_16mb/2026-03-19_RelaxedRecursion/train_gpt.py
+
+RUN_ID=sp1024_5_3x3 \
+DATA_PATH=./data/datasets/fineweb10B_sp1024/ \
+TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model \
+VOCAB_SIZE=1024 \
+USE_WANDB=1 \
+CUDA_VISIBLE_DEVICES=1 \
+NUM_UNIQUE_LAYERS=5 \
+RECURRENT_LAYERS="[0,3,3,3,0]" \
+python3 records/track_10min_16mb/2026-03-19_RelaxedRecursion/train_gpt.py
+
+RUN_ID=sp1024_3_1x7 \
+DATA_PATH=./data/datasets/fineweb10B_sp1024/ \
+TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model \
+VOCAB_SIZE=1024 \
+USE_WANDB=1 \
+CUDA_VISIBLE_DEVICES=2 \
+NUM_UNIQUE_LAYERS=3 \
+RECURRENT_LAYERS="[0,7,0]" \
+python3 records/track_10min_16mb/2026-03-19_RelaxedRecursion/train_gpt.py
+
+RUN_ID=sp1024_5_5x2x3_768_12 \
+DATA_PATH=./data/datasets/fineweb10B_sp1024/ \
+TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model \
+VOCAB_SIZE=1024 \
+USE_WANDB=1 \
+CUDA_VISIBLE_DEVICES=1 \
+NUM_UNIQUE_LAYERS=5 \
+RECURRENT_LAYERS="[0,3,3,0,0]" \
+MODEL_DIM=768 \
+NUM_HEADS=12 \
+python3 records/track_10min_16mb/2026-03-19_RelaxedRecursion/train_gpt.py
+
+RUN_ID=sp1024_3_1x7_1024_nolora \
+DATA_PATH=./data/datasets/fineweb10B_sp1024/ \
+TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model \
+VOCAB_SIZE=1024 \
+USE_WANDB=1 \
+CUDA_VISIBLE_DEVICES=2 \
+NUM_UNIQUE_LAYERS=3 \
+RECURRENT_LAYERS="[0,7,0]" \
+MODEL_DIM=1024 \
+NUM_HEADS=16 \
+USE_RRT_LORA=0
+python3 records/track_10min_16mb/2026-03-19_RelaxedRecursion/train_gpt.py
+
+RUN_ID=sp1024_3_1x1_1024 \
+DATA_PATH=./data/datasets/fineweb10B_sp1024/ \
+TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model \
+VOCAB_SIZE=1024 \
+USE_WANDB=1 \
+CUDA_VISIBLE_DEVICES=0 \
+NUM_UNIQUE_LAYERS=1 \
+RECURRENT_LAYERS="[12]" \
+MODEL_DIM=1024 \
+NUM_HEADS=16 \
+python3 records/track_10min_16mb/2026-03-19_RelaxedRecursion/train_gpt.py
+
+RUN_ID=sp1024_5_5x2x3_768_12_noscales \
+DATA_PATH=./data/datasets/fineweb10B_sp1024/ \
+TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model \
+VOCAB_SIZE=1024 \
+USE_WANDB=1 \
+CUDA_VISIBLE_DEVICES=1 \
+NUM_UNIQUE_LAYERS=5 \
+RECURRENT_LAYERS="[0,3,3,0,0]" \
+MODEL_DIM=768 \
+NUM_HEADS=12 \
+USE_RECURRENCE_SCALES=0 \
+python3 records/track_10min_16mb/2026-03-19_RelaxedRecursion/train_gpt.py
