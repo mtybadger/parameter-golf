@@ -1,13 +1,13 @@
-This record captures the `NorMuon + Selective Quantization` ideas, as well as some tweaks to the baseline, particularly vocab size. I had several ideas I wanted to try today, and these are the ones that worked - I want to chase further on quantization in the coming days.
+This record contains three main new ideas, as well as some tweaks to the baseline, particularly vocab size. I had several ideas I wanted to try today, and these are the ones that worked - I want to chase further on quantization in the coming days.
 
-Trainer changes in this snapshot:
+Changes in this model:
 - Vocab size 1024 -> 8192
-- New "sp8192" tokenizer trained simply using `./data/download_hf_docs_and_tokenize.py   --output-root ./data   --tokenizer-config ./data/tokenizer_specs.json --max-train-tokens 8000000000 --tokenizer-train-docs 100000` with 100000 docs for a 50/50 val/train split
-- NorMuon implementation from ``
-- Selective Quantization: the weights are post-training quantized to int6, while the embeddings are kept at int8. Not sure if this is optimal and have seen plenty of weird behaviour from this, but I think it's in the right direction; I think quantization will be really key to this challenge and I want to dig into it more. From now on there will be a lot of trading off flexibility in various parameters, and I think selectively quantizing some more than others will allow us to do that more fine-grained!
+- New "sp8192" tokenizer trained using `./data/download_hf_docs_and_tokenize.py   --output-root ./data   --tokenizer-config ./data/tokenizer_specs.json --max-train-tokens 8000000000 --tokenizer-train-docs 100000`, for a 50/50 val/train split
+- NorMuon implementation from [the original paper](https://github.com/zichongli5/NorMuon), popularized by `modded-nanogpt`, replacing Muon
+- Selective Quantization: the weights are quantized to int6, while the embeddings are kept at int8. Not sure if this is optimal and have seen plenty of weird behaviour from this, but I think it's in the right direction; I think quantization will be really key to this challenge and I want to dig into it more. From now on there will be a lot of trading off flexibility in various parameters, and I think selectively quantizing some more than others will allow us to do that more fine-grained!
 
 Configuration:
-- Layout: `VOCAB_SIZE=8192 NUM_LAYERS=9 MODEL_DIM=512 NUM_HEADS=8 NUM_KV_HEADS=4 MLP_MULT=2`, all hyperparams as in default NaiveBaseline except VOCAB_SIZE.
+- All hyperparams as in default NaiveBaseline except VOCAB_SIZE
 
 Command:
 ```bash
@@ -31,10 +31,11 @@ TOKENIZER_PATH=./data/tokenizers/fineweb_8192_bpe.model \
 VOCAB_SIZE=8192 \
 MAX_WALLCLOCK_SECONDS=600 \
 WEIGHT_QUANTIZATION_BITS=6 \
-TRAIN_SEQ_LEN=2048 \
 EMBED_QUANTIZATION_BITS=8 \
 WARMDOWN_ITERS=3000 \
-torchrun --standalone --nproc_per_node=8 ./records/track_10min_16mb/2026-03-19_NorMuon+SelectiveQuant/train_gpt.py
+TRAIN_SEQ_LEN=2048 \
+NUM_LAYERS=8 \
+torchrun --standalone --nproc_per_node=8 ./records/track_10min_16mb/2026-03-19_VocabSize_NorMuon_SelectiveQuant/train_gpt.py
 ```
 
 Key metrics (from `train.log`):
