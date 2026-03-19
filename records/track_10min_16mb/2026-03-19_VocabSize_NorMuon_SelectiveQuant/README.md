@@ -2,25 +2,13 @@ This record contains three main new ideas, as well as some tweaks to the baselin
 
 Changes in this model:
 - Vocab size 1024 -> 8192
-- New "sp8192" tokenizer trained using `./data/download_hf_docs_and_tokenize.py   --output-root ./data   --tokenizer-config ./data/tokenizer_specs.json --max-train-tokens 8000000000 --tokenizer-train-docs 100000`, for a 50/50 val/train split
+- New "sp8192" tokenizer trained using `./data/download_hf_docs_and_tokenize.py   --output-root ./data   --tokenizer-config ./data/tokenizer_specs.json --max-train-tokens 8000000000 --tokenizer-train-docs 100000`, for a 50/50 val/train split. Tokenizers for sp1024, 2048, 4096 and 8192 with data available on [my huggingface](https://huggingface.co/sproos/parameter-golf-tokenizers/tree/main)
 - NorMuon implementation from [the original paper](https://github.com/zichongli5/NorMuon), popularized by `modded-nanogpt`, replacing Muon
-- Selective Quantization: the weights are quantized to int6, while the embeddings are kept at int8. Not sure if this is optimal and have seen plenty of weird behaviour from this, but I think it's in the right direction; I think quantization will be really key to this challenge and I want to dig into it more. From now on there will be a lot of trading off flexibility in various parameters, and I think selectively quantizing some more than others will allow us to do that more fine-grained!
+- Selective Quantization: the weights are quantized to int6, while the embeddings are kept at int8. Not sure if this is optimal and have seen plenty of weird behaviour from this, but I think it's in the right direction; I think being precise about precision will be really key to this challenge and I want to dig into it more. From now on there will be a lot of trading off bits between areas of the model!
 
 Configuration:
-- All hyperparams as in default NaiveBaseline except VOCAB_SIZE
-
-Command:
-```bash
-NCCL_IB_DISABLE=1 \
-RUN_ID=hf_verify_sp1024_8gpu \
-DATA_PATH=./data/datasets/fineweb10B_sp1024 \
-TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model \
-VOCAB_SIZE=1024 \
-MAX_WALLCLOCK_SECONDS=600 \
-TRAIN_LOG_EVERY=50 \
-VAL_LOSS_EVERY=200 \
-torchrun --standalone --nproc_per_node=8 ./records/track_10min_16mb/2026-03-19_NorMuon+SelectiveQuant/train_gpt.py
-```
+- All hyperparams as in default NaiveBaseline except VOCAB_SIZE, TRAIN_SEQ_LEN, WARMDOWN_ITERS and NUM_LAYERS; unfortunately to get the increased vocab size we have to sacrifice a layer. I'm sure there's a better architectural setup on the way.
+- Tested on Hyperbolic 8xH100 setup with SXM5; reproduced baseline with `step_avg:43.67ms` and `final_int8_zlib_roundtrip_exact val_bpb:1.22731147` immediately before.
 
 Command:
 ```bash
@@ -39,15 +27,13 @@ torchrun --standalone --nproc_per_node=8 ./records/track_10min_16mb/2026-03-19_V
 ```
 
 Key metrics (from `train.log`):
-- Timed training stopped at `13780/20000` steps due to the wallclock cap.
-- Pre-quant eval at stop: `val_loss:2.0606`, `val_bpb:1.2172`
-- Post-quant roundtrip eval: `val_loss:2.0727`, `val_bpb:1.2244`
-- Exact printed metric: `final_int8_zlib_roundtrip_exact val_bpb:1.22436570`
-- Train time: `600038ms` (`step_avg:43.54ms`)
-- Peak memory: `10184 MiB allocated`, `10200 MiB reserved`
-- Serialized model int8+zlib: `15815847 bytes`
-- Code size: `47642 bytes`
-- Total submission size int8+zlib: `15863489 bytes`
+- Timed training stopped at `9359/20000` steps due to the wallclock cap.
+- Pre-quant eval at stop: `val_loss:3.0261`, `val_bpb:1.1717`
+- Post-quant roundtrip eval: `val_loss:3.06233041`, `val_bpb:1.18576208
+- Train time: `600075ms` (`step_avg:64.12ms`)
+- Serialized model w6e8+zlib: `14743224 bytes`
+- Code size: `53612 bytes`
+- Total submission size w6e8+zlib: `14796836 bytes`
 
 Training volume:
 - Global batch: `524288` tokens/step
