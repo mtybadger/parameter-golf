@@ -47,7 +47,8 @@ python3 data/download_hf_docs_and_tokenize.py \
   --repo-id your-hf-username/your-dataset-repo \
   --remote-root your_50B_export_root \
   --output-root /tmp/my_custom_tokenizer_export \
-  --tokenizer-config ./data/tokenizer_specs.json
+  --tokenizer-config ./data/tokenizer_specs.json \
+  --max-train-tokens 8000000000
 ```
 
 The sidecar `docs_selected.source_manifest.json` includes `docs_sha256`, so users can verify they are rebuilding from the exact same document list and order as the baseline export.
@@ -64,3 +65,5 @@ MATCHED_FINEWEB_GPT2_DECODE_BATCH_SIZE=512
 ```
 
 These control batched tokenizer encoding during shard export, tokenizer thread count, tiktoken thread count, and batched GPT-2 decode for the blobstore docs-cache path.
+
+When rebuilding locally, `--max-train-tokens 8000000000` matches the published 8B-train-token export. With the default shard size of `100_000_000`, that produces 80 train shards plus the full validation split.
