@@ -1,0 +1,19 @@
+RUN_ID=baseline_sp8192_7layernorm \
+DATA_PATH=./data/datasets/fineweb10B_sp8192/ \
+TOKENIZER_PATH=./data/tokenizers/fineweb_8192_bpe.model \
+VOCAB_SIZE=8192 \
+NUM_LAYERS=7 \
+USE_WANDB=1 \
+CUDA_VISIBLE_DEVICES=1 \
+python3 records/track_10min_16mb/2026-03-19_NorMuon/train_gpt.py
+
+RUN_ID=baseline_sp8192_7layeropt \
+DATA_PATH=./data/datasets/fineweb10B_sp8192/ \
+TOKENIZER_PATH=./data/tokenizers/fineweb_8192_bpe.model \
+VOCAB_SIZE=8192 \
+TRAIN_SEQ_LEN=4096 \
+WARMDOWN_ITERS=3000 \
+NUM_LAYERS=7 \
+USE_WANDB=1 \
+CUDA_VISIBLE_DEVICES=1 \
+python3 records/track_10min_16mb/2026-03-19_NorMuon/train_gpt.py
