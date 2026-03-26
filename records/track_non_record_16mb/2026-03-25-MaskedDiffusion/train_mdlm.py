@@ -63,6 +63,7 @@ class Hyperparameters:
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
+    cond_dim = int(os.environ.get("COND_DIM", 64))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
@@ -700,16 +701,15 @@ class DDitFinalLayer(nn.Module):
     ):
         super().__init__()
         self.norm_final = RMSNorm(hidden_size)
-        self.linear = CastedLinear(hidden_size, out_channels, bias=True)
+        self.bias = nn.Parameter(torch.zeros(out_channels, dtype=torch.float32))
         self.adaLN_modulation = CastedLinear(cond_dim, 2 * hidden_size, bias=True)
-        nn.init.zeros_(self.linear.weight)
-        nn.init.zeros_(self.linear.bias)
         nn.init.zeros_(self.adaLN_modulation.weight)
         nn.init.zeros_(self.adaLN_modulation.bias)
 
-    def forward(self, x: Tensor, c: Tensor) -> Tensor:
+    def forward(self, x: Tensor, c: Tensor, weight: Tensor) -> Tensor:
         shift, scale = self.adaLN_modulation(c).chunk(2, dim=-1)
-        return self.linear(modulate(self.norm_final(x), shift, scale))
+        x = modulate(self.norm_final(x), shift, scale)
+        return F.linear(x, weight.to(dtype=x.dtype), self.bias.to(dtype=x.dtype))
 
 
 class LogLinearNoise(nn.Module):
@@ -747,6 +747,7 @@ class MDLM(nn.Module):
         vocab_size: int,
         num_layers: int,
         model_dim: int,
+        cond_dim: int,
         num_heads: int,
         num_kv_heads: int,
         mlp_mult: int,
@@ -769,7 +770,7 @@ class MDLM(nn.Module):
         self.base_vocab_size = vocab_size
         self.mask_index = vocab_size
         self.vocab_size = vocab_size + 1
-        self.cond_dim = max(model_dim // 4, 64)
+        self.cond_dim = cond_dim
         self.sampling_eps = sampling_eps
         self.sampling_steps = sampling_steps
         self.var_eval_steps = var_eval_steps
@@ -815,7 +816,7 @@ class MDLM(nn.Module):
         c = F.silu(self.sigma_map(sigma)).to(dtype=x.dtype)
         for block in self.blocks:
             x = block(x, c)
-        return self.output_layer(x, c)
+        return self.output_layer(x, c, self.vocab_embed.weight)
 
     def subs_log_probs(self, xt: Tensor, sigma: Tensor) -> Tensor:
         logits = self.backbone_logits(xt, sigma).float()
@@ -1116,6 +1117,7 @@ def main() -> None:
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
         model_dim=args.model_dim,
+        cond_dim=args.cond_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
         mlp_mult=args.mlp_mult,
@@ -1138,14 +1140,12 @@ def main() -> None:
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
-    # - token embedding (Adam) uses EMBED_LR
-    # - output projection (Adam) uses HEAD_LR
+    # - tied token embedding / output projection (Adam) uses EMBED_LR
     # - matrix params in the denoiser body use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     named_params = list(base_model.named_parameters())
     excluded_param_ids = {
         id(base_model.vocab_embed.weight),
-        id(base_model.output_layer.linear.weight),
     }
     matrix_params = [
         p
@@ -1164,12 +1164,6 @@ def main() -> None:
         eps=args.adam_eps,
         fused=True,
     )
-    optimizer_head = torch.optim.Adam(
-        [{"params": [base_model.output_layer.linear.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
-        betas=(args.beta1, args.beta2),
-        eps=args.adam_eps,
-        fused=True,
-    )
     optimizer_muon = Muon(
         matrix_params,
         lr=args.matrix_lr,
@@ -1184,7 +1178,7 @@ def main() -> None:
         eps=args.adam_eps,
         fused=True,
     )
-    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_head, optimizer_muon, optimizer_scalar]
+    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
@@ -1199,7 +1193,7 @@ def main() -> None:
         f"mask_index:{base_model.mask_index}"
     )
     log0(
-        f"embed_lr:{token_lr} head_lr:{args.head_lr} "
+        f"tie_embeddings:1 embed_lr:{token_lr} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
