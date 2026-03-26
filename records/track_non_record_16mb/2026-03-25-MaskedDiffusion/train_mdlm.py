@@ -63,6 +63,7 @@ class Hyperparameters:
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
+    cond_dim = int(os.environ.get("COND_DIM", 64))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
@@ -747,6 +748,7 @@ class MDLM(nn.Module):
         vocab_size: int,
         num_layers: int,
         model_dim: int,
+        cond_dim: int,
         num_heads: int,
         num_kv_heads: int,
         mlp_mult: int,
@@ -769,7 +771,7 @@ class MDLM(nn.Module):
         self.base_vocab_size = vocab_size
         self.mask_index = vocab_size
         self.vocab_size = vocab_size + 1
-        self.cond_dim = max(model_dim // 4, 64)
+        self.cond_dim = cond_dim
         self.sampling_eps = sampling_eps
         self.sampling_steps = sampling_steps
         self.var_eval_steps = var_eval_steps
@@ -1116,6 +1118,7 @@ def main() -> None:
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
         model_dim=args.model_dim,
+        cond_dim=args.cond_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
         mlp_mult=args.mlp_mult,
