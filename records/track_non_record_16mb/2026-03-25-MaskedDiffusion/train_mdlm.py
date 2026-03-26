@@ -941,7 +941,7 @@ class MDLM(nn.Module):
         # Why this exists:
         # ----------------
         # The continuous-time SUBS training loss above is a denoising objective, not an exact
-        # token codelength. Converting that loss directly into "bpb" units gives a useful proxy,
+        # token codelength. Converting that loss directly into "bpb" units gives a number,
         # but it is not theoretically comparable to autoregressive validation BPB.
         #
         # For a compression-facing metric we need a proper latent-variable codelength. The exact
@@ -952,13 +952,13 @@ class MDLM(nn.Module):
         #   KL(q(x_T | x_0) || p(x_T))
         #   + sum_t E_q KL(q(x_{t-1} | x_t, x_0) || p_theta(x_{t-1} | x_t))
         #
-        # using the same denoiser p_theta(x_0 | x_t). This is the standard diffusion-ELBO move:
-        # keep training with the efficient continuous objective, but report a tractable
+        # using the same denoiser p_theta(x_0 | x_t). This is the ELBO given in the MDLM paper.
+        # We train with the efficient continuous objective, but report a tractable
         # variational upper bound when we want something closer to a true coding cost.
         #
         # Two modeling decisions are worth spelling out:
         # 1. We discretize time into VAR_EVAL_STEPS. Without that discretization there is no
-        #    finite sum of KL terms to evaluate.
+        #    finite sum of KL terms to evaluate. This is interesting, as the closer to continuous this gets, the lower the upper bound on our BPB.
         # 2. The log-linear schedule never reaches a perfectly masked terminal state; at t=1 a
         #    small fraction of tokens are still visible. To make the terminal distribution
         #    codeable without peeking at x_0, we choose a simple prior that matches the mask mass
@@ -1031,6 +1031,8 @@ class MDLM(nn.Module):
 
     @torch.no_grad()
     def ddpm_caching_update(self, x: Tensor, t: Tensor, t_next: Tensor, p_x0: Tensor | None = None) -> tuple[Tensor, Tensor]:
+        # This function is a variant of the DDPM update step
+        # that utilizes a cached distribution p_x0 for greater efficiency. This allows us to skip computation of p_x0 for each step.
         sigma_t, _ = self.noise(t)
         sigma_s, _ = self.noise(t_next)
         move_chance_t = 1 - torch.exp(-sigma_t)
