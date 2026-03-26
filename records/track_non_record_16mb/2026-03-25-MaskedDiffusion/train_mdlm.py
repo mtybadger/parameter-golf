@@ -796,12 +796,10 @@ class MDLM(nn.Module):
         logits = self.backbone_logits(xt, sigma).float()
         logits[:, :, self.mask_index] = self.neg_infinity
         logits = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
-        positions = (xt != self.mask_index).nonzero(as_tuple=False)
-        if positions.numel() > 0:
-            logits = logits.clone()
-            logits[positions[:, 0], positions[:, 1], :] = self.neg_infinity
-            logits[positions[:, 0], positions[:, 1], xt[xt != self.mask_index]] = 0.0
-        return logits
+        frozen_logits = torch.full_like(logits, self.neg_infinity)
+        frozen_logits.scatter_(-1, xt[..., None], 0.0)
+        visible_mask = (xt != self.mask_index)[..., None]
+        return torch.where(visible_mask, frozen_logits, logits)
 
     def q_xt(self, x0: Tensor, move_chance: Tensor, uniform_noise: Tensor | None = None) -> Tensor:
         if uniform_noise is None:
