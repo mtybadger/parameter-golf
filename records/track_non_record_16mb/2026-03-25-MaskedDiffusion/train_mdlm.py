@@ -55,18 +55,18 @@ class Hyperparameters:
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
-    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
+    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 256))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
-    cond_dim = int(os.environ.get("COND_DIM", str(model_dim)))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
+    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
-    dropout = float(os.environ.get("DROPOUT", 0.1))
+    dropout = float(os.environ.get("DROPOUT", 0.0))
 
     # Diffusion / denoising setup.
     noise_eps = float(os.environ.get("NOISE_EPS", 1e-3))
@@ -600,26 +600,31 @@ class BidirectionalSelfAttention(nn.Module):
         self,
         dim: int,
         num_heads: int,
+        num_kv_heads: int,
         rope_base: float,
     ):
         super().__init__()
         if dim % num_heads != 0:
             raise ValueError("model_dim must be divisible by num_heads")
+        if num_heads % num_kv_heads != 0:
+            raise ValueError("num_heads must be divisible by num_kv_heads")
         self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
         self.head_dim = dim // num_heads
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
-        self.qkv = CastedLinear(dim, 3 * dim, bias=False)
+        kv_dim = self.num_kv_heads * self.head_dim
+        self.c_q = CastedLinear(dim, dim, bias=False)
+        self.c_k = CastedLinear(dim, kv_dim, bias=False)
+        self.c_v = CastedLinear(dim, kv_dim, bias=False)
         self.proj = CastedLinear(dim, dim, bias=False)
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
-        qkv = self.qkv(x).reshape(bsz, seqlen, 3, self.num_heads, self.head_dim)
-        q, k, v = qkv.unbind(dim=2)
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
+        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
@@ -631,6 +636,7 @@ class BidirectionalSelfAttention(nn.Module):
             v,
             attn_mask=None,
             is_causal=False,
+            enable_gqa=(self.num_kv_heads != self.num_heads),
         )
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
@@ -653,6 +659,7 @@ class DDiTBlock(nn.Module):
         self,
         dim: int,
         num_heads: int,
+        num_kv_heads: int,
         cond_dim: int,
         mlp_mult: int,
         rope_base: float,
@@ -661,7 +668,7 @@ class DDiTBlock(nn.Module):
         super().__init__()
         self.norm1 = RMSNorm(dim)
         self.norm2 = RMSNorm(dim)
-        self.attn = BidirectionalSelfAttention(dim, num_heads, rope_base)
+        self.attn = BidirectionalSelfAttention(dim, num_heads, num_kv_heads, rope_base)
         self.mlp = MLP(dim, mlp_mult)
         self.dropout = nn.Dropout(dropout)
         self.adaLN_modulation = CastedLinear(cond_dim, 6 * dim, bias=True)
@@ -724,8 +731,8 @@ class MDLM(nn.Module):
         vocab_size: int,
         num_layers: int,
         model_dim: int,
-        cond_dim: int,
         num_heads: int,
+        num_kv_heads: int,
         mlp_mult: int,
         rope_base: float,
         dropout: float,
@@ -745,6 +752,7 @@ class MDLM(nn.Module):
         self.base_vocab_size = vocab_size
         self.mask_index = vocab_size
         self.vocab_size = vocab_size + 1
+        self.cond_dim = max(model_dim // 4, 64)
         self.sampling_eps = sampling_eps
         self.sampling_steps = sampling_steps
         self.sampler = sampler
@@ -759,13 +767,14 @@ class MDLM(nn.Module):
 
         self.vocab_embed = nn.Embedding(self.vocab_size, model_dim)
         nn.init.kaiming_uniform_(self.vocab_embed.weight, a=math.sqrt(5))
-        self.sigma_map = TimestepEmbedder(cond_dim)
+        self.sigma_map = TimestepEmbedder(self.cond_dim)
         self.blocks = nn.ModuleList(
             [
                 DDiTBlock(
                     model_dim,
                     num_heads,
-                    cond_dim,
+                    num_kv_heads,
+                    self.cond_dim,
                     mlp_mult,
                     rope_base,
                     dropout,
@@ -773,7 +782,7 @@ class MDLM(nn.Module):
                 for _ in range(num_layers)
             ]
         )
-        self.output_layer = DDitFinalLayer(model_dim, self.vocab_size, cond_dim)
+        self.output_layer = DDitFinalLayer(model_dim, self.vocab_size, self.cond_dim)
         self.noise = LogLinearNoise(noise_eps)
 
     def _process_sigma(self, sigma: Tensor) -> Tensor:
@@ -1007,8 +1016,8 @@ def main() -> None:
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
         model_dim=args.model_dim,
-        cond_dim=args.cond_dim,
         num_heads=args.num_heads,
+        num_kv_heads=args.num_kv_heads,
         mlp_mult=args.mlp_mult,
         rope_base=args.rope_base,
         dropout=args.dropout,
@@ -1080,7 +1089,10 @@ def main() -> None:
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
-    log0(f"attention_mode:bidirectional_dit num_heads:{args.num_heads}")
+    log0(
+        f"attention_mode:bidirectional_gqa num_heads:{args.num_heads} "
+        f"num_kv_heads:{args.num_kv_heads} cond_dim:{base_model.cond_dim}"
+    )
     log0(
         f"base_vocab_size:{args.vocab_size} model_vocab_size:{base_model.vocab_size} "
         f"mask_index:{base_model.mask_index}"
