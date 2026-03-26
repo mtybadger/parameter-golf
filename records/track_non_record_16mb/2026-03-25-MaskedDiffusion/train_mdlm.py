@@ -1,7 +1,8 @@
 """
-The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching-off points for new participants, not SOTA configs. We'll accept PRs that tune, improve, or simplify these scripts without significantly increasing complexity, but competitive submissions should stay in the `/records` folder.
-
-Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `train_gpt_mlx.py` never are longer than 1500 lines.
+Masked Diffusion Language Model, adapted to train_gpt.py from https://github.com/kuleshov-group/mdlm
+This is a discrete diffusion model that masks out some of the tokens in the sequence and then denoises them.
+Other than the objective, sampling schedule, and conditioning, this is largely architecturally similar to train_gpt.py for A2A comparison.
+The hypers have been untouched since I don't respect diffusion language models, but in theory diffusion models may be useful for this challenge since they can spend arbitrary amounts of compute per-token.
 """
 
 from __future__ import annotations
@@ -72,6 +73,7 @@ class Hyperparameters:
     noise_eps = float(os.environ.get("NOISE_EPS", 1e-3))
     sampling_eps = float(os.environ.get("SAMPLING_EPS", 1e-3))
     sampling_steps = int(os.environ.get("SAMPLING_STEPS", 256))
+    var_eval_steps = int(os.environ.get("VAR_EVAL_STEPS", 256))
     sampler = os.environ.get("SAMPLER", "ddpm_cache")
     sampling_schedule = os.environ.get("SAMPLING_SCHEDULE", "linear")
     antithetic_sampling = bool(int(os.environ.get("ANTITHETIC_SAMPLING", "1")))
@@ -234,8 +236,11 @@ def eval_val(
     is_boundary_token_lut: Tensor,
 ) -> tuple[float, float]:
     # Validation computes two metrics:
-    # - val_loss: diffusion token NLL estimate (natural log)
-    # - val_bpb: tokenizer-agnostic compression metric used by the challenge
+    # - val_loss: continuous-time denoising objective used for training
+    # - val_var_bpb: byte-normalized variational upper bound on NLL
+    #   This is the quantity we can compare most honestly to AR compression metrics.
+    #   It is still an upper bound rather than an exact NLL, but unlike the raw
+    #   denoising loss it corresponds to a bona fide latent-variable codelength.
     local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
     if local_batch_tokens < args.train_seq_len:
         raise ValueError(
@@ -248,6 +253,7 @@ def eval_val(
     seq_start = (total_seqs * rank) // world_size
     seq_end = (total_seqs * (rank + 1)) // world_size
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    val_vlb_bits_sum = torch.zeros((), device=device, dtype=torch.float64)
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
@@ -261,13 +267,14 @@ def eval_val(
             prev_ids = local[:-1].reshape(-1, args.train_seq_len)
             x0 = local[1:].reshape(-1, args.train_seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                batch_loss, _ = model.loss_on_batch(
+                batch_loss, batch_vlb_bits = model.validation_metrics_on_batch(
                     x0,
                     deterministic_t=True,
                     t_offset=float(batch_seq_start),
                 )
             batch_token_count = float(x0.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
+            val_vlb_bits_sum += batch_vlb_bits.to(torch.float64).sum()
             val_token_count += batch_token_count
             prev_ids = prev_ids.reshape(-1)
             tgt_ids = x0.reshape(-1)
@@ -277,14 +284,14 @@ def eval_val(
 
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_vlb_bits_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
         dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
 
     val_loss = val_loss_sum / val_token_count
-    bits_per_token = val_loss.item() / math.log(2.0)
-    tokens_per_byte = val_token_count.item() / val_byte_count.item()
+    val_var_bpb = val_vlb_bits_sum / val_byte_count
     model.train()
-    return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+    return float(val_loss.item()), float(val_var_bpb.item())
 
 # -----------------------------
 # POST-TRAINING QUANTIZATION
@@ -725,6 +732,15 @@ def sample_categorical(categorical_probs: Tensor) -> Tensor:
     return (categorical_probs / gumbel_norm).argmax(dim=-1)
 
 
+def hashed_uniform_like(reference: Tensor, offset: float) -> Tensor:
+    # Validation metrics need deterministic latent-noise samples so repeated evals on the
+    # same checkpoint are stable. We use a simple hash of token position + offset rather than
+    # an RNG stateful stream so distributed workers can reproduce the same q-samples exactly.
+    positions = torch.arange(reference.numel(), device=reference.device, dtype=torch.float32).reshape_as(reference)
+    hashed = torch.sin(positions * 12.9898 + (1.0 + offset) * 78.233) * 43758.5453
+    return torch.remainder(hashed, 1.0)
+
+
 class MDLM(nn.Module):
     def __init__(
         self,
@@ -739,6 +755,7 @@ class MDLM(nn.Module):
         noise_eps: float,
         sampling_eps: float,
         sampling_steps: int,
+        var_eval_steps: int,
         sampler: str,
         sampling_schedule: str,
         antithetic_sampling: bool,
@@ -755,6 +772,7 @@ class MDLM(nn.Module):
         self.cond_dim = max(model_dim // 4, 64)
         self.sampling_eps = sampling_eps
         self.sampling_steps = sampling_steps
+        self.var_eval_steps = var_eval_steps
         self.sampler = sampler
         self.sampling_schedule = sampling_schedule
         self.antithetic_sampling = antithetic_sampling
@@ -854,14 +872,93 @@ class MDLM(nn.Module):
         move_chance = 1 - torch.exp(-sigma[:, None])
         uniform_noise = None
         if deterministic_t:
-            positions = torch.arange(x0.numel(), device=x0.device, dtype=torch.float32).reshape_as(x0)
-            hashed = torch.sin(positions * 12.9898 + (1.0 + t_offset) * 78.233) * 43758.5453
-            uniform_noise = torch.remainder(hashed, 1.0)
+            uniform_noise = hashed_uniform_like(x0, t_offset)
         xt = self.q_xt(x0, move_chance, uniform_noise=uniform_noise)
         log_probs = self.subs_log_probs(xt, sigma)
         log_p_theta = torch.gather(log_probs, dim=-1, index=x0[:, :, None]).squeeze(-1)
         loss = -log_p_theta * (dsigma / torch.expm1(sigma))[:, None]
         return loss.mean(), loss
+
+    def variational_bits_on_batch(
+        self,
+        x0: Tensor,
+        deterministic_t: bool = False,
+        t_offset: float = 0.0,
+    ) -> Tensor:
+        # Why this exists:
+        # ----------------
+        # The continuous-time SUBS training loss above is a denoising objective, not an exact
+        # token codelength. Converting that loss directly into "bpb" units gives a useful proxy,
+        # but it is not theoretically comparable to autoregressive validation BPB.
+        #
+        # For a compression-facing metric we need a proper latent-variable codelength. The exact
+        # code for the current continuous process is not tractable because it would require
+        # integrating over all latent corruption trajectories. We therefore evaluate a *discrete*
+        # absorbing-mask variational bound instead:
+        #
+        #   KL(q(x_T | x_0) || p(x_T))
+        #   + sum_t E_q KL(q(x_{t-1} | x_t, x_0) || p_theta(x_{t-1} | x_t))
+        #
+        # using the same denoiser p_theta(x_0 | x_t). This is the standard diffusion-ELBO move:
+        # keep training with the efficient continuous objective, but report a tractable
+        # variational upper bound when we want something closer to a true coding cost.
+        #
+        # Two modeling decisions are worth spelling out:
+        # 1. We discretize time into VAR_EVAL_STEPS. Without that discretization there is no
+        #    finite sum of KL terms to evaluate.
+        # 2. The log-linear schedule never reaches a perfectly masked terminal state; at t=1 a
+        #    small fraction of tokens are still visible. To make the terminal distribution
+        #    codeable without peeking at x_0, we choose a simple prior that matches the mask mass
+        #    and allocates the remaining visible mass uniformly over the clean vocabulary. This
+        #    adds the terminal KL term below.
+        if self.var_eval_steps <= 0:
+            raise ValueError("VAR_EVAL_STEPS must be positive")
+        batch_size, seq_len = x0.shape
+        device = x0.device
+        total_bits = torch.zeros((batch_size,), device=device, dtype=torch.float32)
+
+        t_grid = torch.arange(1, self.var_eval_steps + 1, device=device, dtype=torch.float32) / self.var_eval_steps
+        sigma_grid, _ = self.noise(t_grid)
+        alpha_grid = torch.exp(-sigma_grid)
+
+        # Terminal prior p(x_T): keep the same mask mass as q(x_T | x_0), but spread any
+        # residual visible-token mass uniformly over the clean vocabulary so the prior does not
+        # depend on the target sequence itself.
+        alpha_T = alpha_grid[-1]
+        total_bits = total_bits + (seq_len * alpha_T * math.log(self.base_vocab_size) / math.log(2.0))
+
+        alpha_prev = torch.tensor(1.0, device=device, dtype=torch.float32)
+        for step_idx in range(self.var_eval_steps):
+            t_curr = t_grid[step_idx].expand(batch_size)
+            sigma_curr = sigma_grid[step_idx].expand(batch_size)
+            alpha_curr = alpha_grid[step_idx]
+            move_chance = 1 - alpha_curr
+            uniform_noise = None
+            if deterministic_t:
+                uniform_noise = hashed_uniform_like(x0, t_offset + 17.0 + 1.61803398875 * step_idx)
+            xt = self.q_xt(x0, move_chance.expand(batch_size, 1), uniform_noise=uniform_noise)
+            log_probs = self.subs_log_probs(xt, sigma_curr)
+            log_p_x0 = torch.gather(log_probs, dim=-1, index=x0[:, :, None]).squeeze(-1)
+
+            # For the absorbing-mask chain, if x_t is already visible then x_{t-1} is determined.
+            # Only masked positions contribute a KL term. The coefficient below is the exact
+            # posterior probability that a token was still visible at the previous discrete step
+            # given that it is masked at the current step.
+            reveal_prob = (alpha_prev - alpha_curr) / max(1.0 - float(alpha_curr.item()), 1e-12)
+            step_nats = -reveal_prob * log_p_x0 * (xt == self.mask_index)
+            total_bits = total_bits + step_nats.sum(dim=-1) / math.log(2.0)
+            alpha_prev = alpha_curr
+        return total_bits
+
+    def validation_metrics_on_batch(
+        self,
+        x0: Tensor,
+        deterministic_t: bool = False,
+        t_offset: float = 0.0,
+    ) -> tuple[Tensor, Tensor]:
+        batch_loss, _ = self.loss_on_batch(x0, deterministic_t=deterministic_t, t_offset=t_offset)
+        var_bits = self.variational_bits_on_batch(x0, deterministic_t=deterministic_t, t_offset=t_offset)
+        return batch_loss, var_bits
 
     def forward(self, x0: Tensor) -> Tensor:
         loss, _ = self.loss_on_batch(x0)
@@ -1004,7 +1101,10 @@ def main() -> None:
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
     )
-    log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
+    log0(
+        f"val_var_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path} "
+        f"var_eval_steps:{args.var_eval_steps}"
+    )
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
 
@@ -1024,6 +1124,7 @@ def main() -> None:
         noise_eps=args.noise_eps,
         sampling_eps=args.sampling_eps,
         sampling_steps=args.sampling_steps,
+        var_eval_steps=args.var_eval_steps,
         sampler=args.sampler,
         sampling_schedule=args.sampling_schedule,
         antithetic_sampling=args.antithetic_sampling,
@@ -1104,7 +1205,7 @@ def main() -> None:
     log0(
         f"noise:loglinear noise_eps:{args.noise_eps} sampling_eps:{args.sampling_eps} "
         f"sampler:{args.sampler} sampling_schedule:{args.sampling_schedule} "
-        f"sampling_steps:{args.sampling_steps} "
+        f"sampling_steps:{args.sampling_steps} var_eval_steps:{args.var_eval_steps} "
         f"time_conditioning:{int(args.time_conditioning)} antithetic:{int(args.antithetic_sampling)}"
     )
     log0(
@@ -1182,7 +1283,7 @@ def main() -> None:
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
-            val_loss, val_bpb = eval_val(
+            val_loss, val_var_bpb = eval_val(
                 args,
                 base_model,
                 rank,
@@ -1195,7 +1296,7 @@ def main() -> None:
                 is_boundary_token_lut,
             )
             log0(
-                f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
+                f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_var_bpb:{val_var_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
             torch.cuda.synchronize()
@@ -1304,7 +1405,7 @@ def main() -> None:
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
-    q_val_loss, q_val_bpb = eval_val(
+    q_val_loss, q_val_var_bpb = eval_val(
         args,
         base_model,
         rank,
@@ -1318,10 +1419,10 @@ def main() -> None:
     )
     torch.cuda.synchronize()
     log0(
-        f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+        f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_var_bpb:{q_val_var_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
-    log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_var_bpb:{q_val_var_bpb:.8f}")
 
     if distributed:
         dist.destroy_process_group()
