@@ -225,7 +225,7 @@ def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
 
 def eval_val(
     args: Hyperparameters,
-    model: MDLM,
+    model: DiffusionLM,
     rank: int,
     world_size: int,
     device: torch.device,
@@ -234,11 +234,13 @@ def eval_val(
     base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
-) -> tuple[float, float, float]:
+) -> tuple[float, float]:
     # Validation computes two metrics:
     # - val_loss: full continuous diffusion training objective
-    # - val_recon_nll: token-space reconstruction CE from the denoised x0 prediction
-    # - val_bpb_proxy: tokenizer-agnostic compression proxy derived from val_recon_nll
+    # - val_var_bpb: byte-normalized variational upper bound on NLL
+    #   This is not exact BPB. Exact token likelihood would require integrating
+    #   over the continuous x_0 latent, which is intractable. We therefore report
+    #   the full ELBO/VLB sum normalized by bytes instead.
     local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
     if local_batch_tokens < args.train_seq_len:
         raise ValueError(
@@ -251,7 +253,7 @@ def eval_val(
     seq_start = (total_seqs * rank) // world_size
     seq_end = (total_seqs * (rank + 1)) // world_size
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
-    val_recon_nll_sum = torch.zeros((), device=device, dtype=torch.float64)
+    val_vlb_bits_sum = torch.zeros((), device=device, dtype=torch.float64)
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
@@ -265,15 +267,14 @@ def eval_val(
             prev_ids = local[:-1].reshape(-1, args.train_seq_len)
             x0 = local[1:].reshape(-1, args.train_seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                batch_loss, metrics = model.loss_on_batch(
+                batch_loss, batch_vlb_bits = model.validation_metrics_on_batch(
                     x0,
                     deterministic_t=True,
                     t_offset=float(batch_seq_start),
-                    return_metrics=True,
                 )
             batch_token_count = float(x0.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
-            val_recon_nll_sum += metrics["recon_nll"].to(torch.float64).sum() * args.train_seq_len
+            val_vlb_bits_sum += batch_vlb_bits.to(torch.float64).sum()
             val_token_count += batch_token_count
             prev_ids = prev_ids.reshape(-1)
             tgt_ids = x0.reshape(-1)
@@ -283,16 +284,14 @@ def eval_val(
 
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
-        dist.all_reduce(val_recon_nll_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_vlb_bits_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
         dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
 
     val_loss = val_loss_sum / val_token_count
-    val_recon_nll = val_recon_nll_sum / val_token_count
-    bits_per_token = val_recon_nll.item() / math.log(2.0)
-    tokens_per_byte = val_token_count.item() / val_byte_count.item()
+    val_var_bpb = val_vlb_bits_sum / val_byte_count
     model.train()
-    return float(val_loss.item()), float(val_recon_nll.item()), float(bits_per_token * tokens_per_byte)
+    return float(val_loss.item()), float(val_var_bpb.item())
 
 # -----------------------------
 # POST-TRAINING QUANTIZATION
@@ -719,6 +718,31 @@ def mean_flat(x: Tensor) -> Tensor:
     return x.mean(dim=tuple(range(1, x.ndim)))
 
 
+def sum_flat(x: Tensor) -> Tensor:
+    return x.sum(dim=tuple(range(1, x.ndim)))
+
+
+def normal_kl(mean1, logvar1, mean2, logvar2):
+    tensor = None
+    for obj in (mean1, logvar1, mean2, logvar2):
+        if isinstance(obj, torch.Tensor):
+            tensor = obj
+            break
+    if tensor is None:
+        raise TypeError("normal_kl expects at least one tensor argument")
+    logvar1, logvar2 = [
+        x if isinstance(x, torch.Tensor) else torch.tensor(x, device=tensor.device, dtype=tensor.dtype)
+        for x in (logvar1, logvar2)
+    ]
+    return 0.5 * (
+        -1.0
+        + logvar2
+        - logvar1
+        + torch.exp(logvar1 - logvar2)
+        + (mean1 - mean2).square() * torch.exp(-logvar2)
+    )
+
+
 def betas_for_alpha_bar(num_diffusion_timesteps: int, alpha_bar, max_beta: float = 0.999) -> np.ndarray:
     betas = []
     for i in range(num_diffusion_timesteps):
@@ -756,7 +780,7 @@ def hashed_gaussian_like(x: Tensor, offset: float) -> Tensor:
     return (math.sqrt(2.0) * torch.erfinv(2.0 * uniform - 1.0)).to(dtype=x.dtype)
 
 
-class MDLM(nn.Module):
+class DiffusionLM(nn.Module):
     def __init__(
         self,
         vocab_size: int,
@@ -825,9 +849,23 @@ class MDLM(nn.Module):
         alphas = 1.0 - betas
         alphas_cumprod = torch.cumprod(alphas, dim=0)
         alphas_cumprod_prev = torch.cat([torch.ones(1, dtype=torch.float32), alphas_cumprod[:-1]], dim=0)
+        posterior_variance = betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
+        if diffusion_steps > 1:
+            posterior_log_variance_clipped = torch.log(
+                torch.cat([posterior_variance[1:2], posterior_variance[1:]], dim=0).clamp_min(1e-20)
+            )
+        else:
+            posterior_log_variance_clipped = torch.log(posterior_variance.clamp_min(1e-20))
+        posterior_mean_coef1 = betas * torch.sqrt(alphas_cumprod_prev) / (1.0 - alphas_cumprod)
+        posterior_mean_coef2 = (1.0 - alphas_cumprod_prev) * torch.sqrt(alphas) / (1.0 - alphas_cumprod)
+        self.register_buffer("alphas", alphas, persistent=False)
         self.register_buffer("betas", betas, persistent=False)
         self.register_buffer("alphas_cumprod", alphas_cumprod, persistent=False)
         self.register_buffer("alphas_cumprod_prev", alphas_cumprod_prev, persistent=False)
+        self.register_buffer("posterior_variance", posterior_variance, persistent=False)
+        self.register_buffer("posterior_log_variance_clipped", posterior_log_variance_clipped, persistent=False)
+        self.register_buffer("posterior_mean_coef1", posterior_mean_coef1, persistent=False)
+        self.register_buffer("posterior_mean_coef2", posterior_mean_coef2, persistent=False)
         self.register_buffer("sqrt_alphas_cumprod", torch.sqrt(alphas_cumprod), persistent=False)
         self.register_buffer(
             "sqrt_one_minus_alphas_cumprod",
@@ -877,6 +915,15 @@ class MDLM(nn.Module):
         variance = 1.0 - extract(self.alphas_cumprod, t, x_start.shape, x_start.dtype)
         return mean, variance
 
+    def q_posterior_mean_variance_step(self, x_start: Tensor, x_t: Tensor, t: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        mean = (
+            extract(self.posterior_mean_coef1, t, x_t.shape, x_t.dtype) * x_start
+            + extract(self.posterior_mean_coef2, t, x_t.shape, x_t.dtype) * x_t
+        )
+        variance = extract(self.posterior_variance, t, x_t.shape, x_t.dtype)
+        log_variance = extract(self.posterior_log_variance_clipped, t, x_t.shape, x_t.dtype)
+        return mean, variance, log_variance
+
     def predict_xstart_from_eps(self, x_t: Tensor, t: Tensor, eps: Tensor) -> Tensor:
         return (
             extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape, x_t.dtype) * x_t
@@ -910,6 +957,121 @@ class MDLM(nn.Module):
         t = torch.floor(u * self.diffusion_steps).to(torch.long)
         return t.clamp_(min=self.final_sampling_index, max=self.diffusion_steps - 1)
 
+    def _prepare_batch(self, x0: Tensor, t: Tensor, deterministic_noise: bool, t_offset: float) -> dict[str, Tensor]:
+        x_start_mean = self.get_embeds(x0)
+        if deterministic_noise:
+            x_start_noise = hashed_gaussian_like(x_start_mean, t_offset + 17.0)
+            q_noise = hashed_gaussian_like(x_start_mean, t_offset + 31.0)
+        else:
+            x_start_noise = torch.randn_like(x_start_mean)
+            q_noise = torch.randn_like(x_start_mean)
+        x_start = x_start_mean + self.start_noise_std * x_start_noise
+        xt = self.q_sample(x_start, t, noise=q_noise)
+        model_output = self.backbone_denoise(xt, t)
+        pred_xstart = model_output if self.predict_xstart else self.predict_xstart_from_eps(xt, t, model_output)
+        return {
+            "t": t,
+            "x_start_mean": x_start_mean,
+            "x_start": x_start,
+            "xt": xt,
+            "model_output": model_output,
+            "pred_xstart": pred_xstart,
+            "q_noise": q_noise,
+        }
+
+    def _training_metrics_from_prepared(self, x0: Tensor, prepared: dict[str, Tensor]) -> dict[str, Tensor]:
+        t = prepared["t"]
+        x_start = prepared["x_start"]
+        x_start_mean = prepared["x_start_mean"]
+        pred_xstart = prepared["pred_xstart"]
+        model_output = prepared["model_output"]
+        q_noise = prepared["q_noise"]
+        target = x_start if self.predict_xstart else q_noise
+
+        mse = mean_flat((target - model_output).square())
+        t0_loss = mean_flat((x_start_mean - pred_xstart).square())
+        mse = torch.where(t == 0, t0_loss, mse)
+
+        t_final = torch.full_like(t, self.diffusion_steps - 1)
+        out_mean, _ = self.q_mean_variance(x_start, t_final)
+        prior_loss = mean_flat(out_mean.square())
+
+        decoder_logits = self.get_logits(x_start).float()
+        decoder_nll_tokens = F.cross_entropy(
+            decoder_logits.reshape(-1, self.vocab_size),
+            x0.reshape(-1),
+            reduction="none",
+        ).view_as(x0)
+        decoder_nll = decoder_nll_tokens.mean(dim=-1)
+
+        recon_logits = self.get_logits(pred_xstart).float()
+        recon_nll = F.cross_entropy(
+            recon_logits.reshape(-1, self.vocab_size),
+            x0.reshape(-1),
+            reduction="none",
+        ).view_as(x0).mean(dim=-1)
+
+        total = mse + decoder_nll + prior_loss
+        return {
+            "total": total,
+            "mse": mse,
+            "decoder_nll": decoder_nll,
+            "prior_loss": prior_loss,
+            "recon_nll": recon_nll,
+            "decoder_nll_tokens": decoder_nll_tokens,
+        }
+
+    def variational_bits_on_batch(
+        self,
+        x0: Tensor,
+        deterministic_noise: bool = False,
+        t_offset: float = 0.0,
+    ) -> Tensor:
+        # For a continuous diffusion LM the exact token likelihood p(y) is intractable:
+        # it marginalizes over the continuous latent x_0. What we can compute exactly
+        # for fixed model parameters is the variational bound
+        #   KL(q(x_T|y)||p(x_T)) + sum_t KL(q(x_{t-1}|x_t,y)||p(x_{t-1}|x_t))
+        #   + E_q[-log p(y|x_0)].
+        # This routine sums all timestep terms, matching the standard diffusion ELBO
+        # evaluation rather than a single-timestep Monte Carlo estimate.
+        x_start_mean = self.get_embeds(x0)
+        if deterministic_noise:
+            x_start_noise = hashed_gaussian_like(x_start_mean, t_offset + 17.0)
+        else:
+            x_start_noise = torch.randn_like(x_start_mean)
+        x_start = x_start_mean + self.start_noise_std * x_start_noise
+
+        decoder_logits = self.get_logits(x_start).float()
+        decoder_nll_tokens = F.cross_entropy(
+            decoder_logits.reshape(-1, self.vocab_size),
+            x0.reshape(-1),
+            reduction="none",
+        ).view_as(x0)
+        total_bits = decoder_nll_tokens.sum(dim=-1) / math.log(2.0)
+
+        t_final = torch.full((x0.shape[0],), self.diffusion_steps - 1, device=x0.device, dtype=torch.long)
+        qT_mean, qT_variance = self.q_mean_variance(x_start, t_final)
+        total_bits = total_bits + sum_flat(normal_kl(qT_mean, torch.log(qT_variance.clamp_min(1e-20)), 0.0, 0.0)) / math.log(2.0)
+
+        start_log_variance = math.log(max(self.start_noise_std * self.start_noise_std, 1e-20))
+        for t_int in range(self.diffusion_steps - 1, -1, -1):
+            t = torch.full((x0.shape[0],), t_int, device=x0.device, dtype=torch.long)
+            if deterministic_noise:
+                q_noise = hashed_gaussian_like(x_start_mean, t_offset + 31.0 + 1.61803398875 * t_int)
+            else:
+                q_noise = torch.randn_like(x_start_mean)
+            xt = self.q_sample(x_start, t, noise=q_noise)
+            model_output = self.backbone_denoise(xt, t)
+            pred_xstart = model_output if self.predict_xstart else self.predict_xstart_from_eps(xt, t, model_output)
+            model_mean, _, model_log_variance = self.q_posterior_mean_variance_step(pred_xstart, xt, t)
+            if t_int == 0:
+                step_bits = sum_flat(normal_kl(x_start_mean, start_log_variance, model_mean, model_log_variance)) / math.log(2.0)
+            else:
+                true_mean, _, true_log_variance = self.q_posterior_mean_variance_step(x_start, xt, t)
+                step_bits = sum_flat(normal_kl(true_mean, true_log_variance, model_mean, model_log_variance)) / math.log(2.0)
+            total_bits = total_bits + step_bits
+        return total_bits
+
     def build_sampling_timesteps(self, num_steps: int, device: torch.device) -> Tensor:
         if num_steps <= 0:
             raise ValueError("num_steps must be positive")
@@ -941,51 +1103,21 @@ class MDLM(nn.Module):
         return_metrics: bool = False,
     ) -> tuple[Tensor, dict[str, Tensor] | Tensor]:
         t = self.sample_t(x0.shape[0], x0.device, deterministic_t=deterministic_t, t_offset=t_offset)
-        x_start_mean = self.get_embeds(x0)
-        if deterministic_t:
-            x_start_noise = hashed_gaussian_like(x_start_mean, t_offset + 17.0)
-            q_noise = hashed_gaussian_like(x_start_mean, t_offset + 31.0)
-        else:
-            x_start_noise = torch.randn_like(x_start_mean)
-            q_noise = torch.randn_like(x_start_mean)
-        x_start = x_start_mean + self.start_noise_std * x_start_noise
-        xt = self.q_sample(x_start, t, noise=q_noise)
-        model_output = self.backbone_denoise(xt, t)
-        pred_xstart = model_output if self.predict_xstart else self.predict_xstart_from_eps(xt, t, model_output)
-        target = x_start if self.predict_xstart else q_noise
-
-        mse = mean_flat((target - model_output).square())
-        t0_loss = mean_flat((x_start_mean - pred_xstart).square())
-        mse = torch.where(t == 0, t0_loss, mse)
-
-        t_final = torch.full_like(t, self.diffusion_steps - 1)
-        out_mean, _ = self.q_mean_variance(x_start, t_final)
-        prior_loss = mean_flat(out_mean.square())
-
-        decoder_logits = self.get_logits(x_start).float()
-        decoder_nll = F.cross_entropy(
-            decoder_logits.reshape(-1, self.vocab_size),
-            x0.reshape(-1),
-            reduction="none",
-        ).view_as(x0).mean(dim=-1)
-
-        recon_logits = self.get_logits(pred_xstart).float()
-        recon_nll = F.cross_entropy(
-            recon_logits.reshape(-1, self.vocab_size),
-            x0.reshape(-1),
-            reduction="none",
-        ).view_as(x0).mean(dim=-1)
-
-        total = mse + decoder_nll + prior_loss
+        prepared = self._prepare_batch(x0, t, deterministic_noise=deterministic_t, t_offset=t_offset)
+        metrics = self._training_metrics_from_prepared(x0, prepared)
         if return_metrics:
-            return total.mean(), {
-                "total": total,
-                "mse": mse,
-                "decoder_nll": decoder_nll,
-                "prior_loss": prior_loss,
-                "recon_nll": recon_nll,
-            }
-        return total.mean(), total
+            return metrics["total"].mean(), metrics
+        return metrics["total"].mean(), metrics["total"]
+
+    def validation_metrics_on_batch(
+        self,
+        x0: Tensor,
+        deterministic_t: bool = False,
+        t_offset: float = 0.0,
+    ) -> tuple[Tensor, Tensor]:
+        batch_loss, _ = self.loss_on_batch(x0, deterministic_t=deterministic_t, t_offset=t_offset, return_metrics=False)
+        var_bits = self.variational_bits_on_batch(x0, deterministic_noise=deterministic_t, t_offset=t_offset)
+        return batch_loss, var_bits
 
     def forward(self, x0: Tensor) -> Tensor:
         loss, _ = self.loss_on_batch(x0)
@@ -1102,7 +1234,7 @@ def main() -> None:
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
     )
-    log0(f"val_bpb_proxy:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
+    log0(f"val_var_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
 
@@ -1110,7 +1242,7 @@ def main() -> None:
     # MODEL + OPTIMIZER SETUP
     # -----------------------------
 
-    base_model = MDLM(
+    base_model = DiffusionLM(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
         model_dim=args.model_dim,
@@ -1278,7 +1410,7 @@ def main() -> None:
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
-            val_loss, val_recon_nll, val_bpb_proxy = eval_val(
+            val_loss, val_var_bpb = eval_val(
                 args,
                 base_model,
                 rank,
@@ -1292,7 +1424,7 @@ def main() -> None:
             )
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} "
-                f"val_recon_nll:{val_recon_nll:.4f} val_bpb_proxy:{val_bpb_proxy:.4f} "
+                f"val_var_bpb:{val_var_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
             torch.cuda.synchronize()
@@ -1401,7 +1533,7 @@ def main() -> None:
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
-    q_val_loss, q_val_recon_nll, q_val_bpb_proxy = eval_val(
+    q_val_loss, q_val_var_bpb = eval_val(
         args,
         base_model,
         rank,
@@ -1416,12 +1548,12 @@ def main() -> None:
     torch.cuda.synchronize()
     log0(
         f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} "
-        f"val_recon_nll:{q_val_recon_nll:.4f} val_bpb_proxy:{q_val_bpb_proxy:.4f} "
+        f"val_var_bpb:{q_val_var_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(
         f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} "
-        f"val_recon_nll:{q_val_recon_nll:.8f} val_bpb_proxy:{q_val_bpb_proxy:.8f}"
+        f"val_var_bpb:{q_val_var_bpb:.8f}"
     )
 
     if distributed:

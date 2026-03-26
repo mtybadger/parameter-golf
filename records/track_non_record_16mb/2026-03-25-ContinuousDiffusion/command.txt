@@ -1,0 +1,4 @@
+RUN_ID=baseline_mdlm \
+DATA_PATH=./data/datasets/fineweb10B_sp1024/ \
+TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model \
+python3 records/track_non_record_16mb/2026-03-25-ContinuousDiffusion/train_dlm.py
