@@ -559,16 +559,14 @@ def modulate(x: Tensor, shift: Tensor, scale: Tensor) -> Tensor:
     return x * (1 + scale[:, None, :]) + shift[:, None, :]
 
 
-class LayerNorm(nn.Module):
-    def __init__(self, dim: int):
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float | None = None):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.dim = dim
+        self.eps = eps
 
     def forward(self, x: Tensor) -> Tensor:
-        with torch.cuda.amp.autocast(enabled=False):
-            y = F.layer_norm(x.float(), (self.dim,))
-        return y.to(dtype=x.dtype) * self.weight.to(dtype=x.dtype)[None, None, :]
+        return F.rms_norm(x, (self.dim,), eps=self.eps)
 
 
 class TimestepEmbedder(nn.Module):
@@ -661,8 +659,8 @@ class DDiTBlock(nn.Module):
         dropout: float,
     ):
         super().__init__()
-        self.norm1 = LayerNorm(dim)
-        self.norm2 = LayerNorm(dim)
+        self.norm1 = RMSNorm(dim)
+        self.norm2 = RMSNorm(dim)
         self.attn = BidirectionalSelfAttention(dim, num_heads, rope_base)
         self.mlp = MLP(dim, mlp_mult)
         self.dropout = nn.Dropout(dropout)
@@ -687,7 +685,7 @@ class DDitFinalLayer(nn.Module):
         cond_dim: int,
     ):
         super().__init__()
-        self.norm_final = LayerNorm(hidden_size)
+        self.norm_final = RMSNorm(hidden_size)
         self.linear = CastedLinear(hidden_size, out_channels, bias=True)
         self.adaLN_modulation = CastedLinear(cond_dim, 2 * hidden_size, bias=True)
         nn.init.zeros_(self.linear.weight)
