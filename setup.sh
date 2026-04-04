@@ -1,3 +1,11 @@
+#!/usr/bin/env bash
+# This script runs in its own process. Activating the venv here does not affect
+# your interactive shell after it finishes. When setup completes, run:
+#   source .venv/bin/activate
+# (Or open a new terminal and activate there.)
+
+PROJECT_ROOT="$(pwd)"
+
 rm -rf data
 git clone https://huggingface.co/sproos/parameter-golf-tokenizers data
 curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -10,7 +18,7 @@ git config --global user.name "Spruce Campbell" && git config --global user.emai
 git clone https://github.com/dao-ailab/flash-attention
 sudo apt update && sudo apt install git-lfs
 cd flash-attention/hopper
-MAX_JOBS=64 \
+MAX_JOBS=32 \
 FLASH_ATTENTION_DISABLE_BACKWARD=FALSE \
 FLASH_ATTENTION_DISABLE_SPLIT=FALSE \
 FLASH_ATTENTION_DISABLE_PAGEDKV=TRUE \
@@ -32,3 +40,7 @@ python setup.py install
 cd data
 git lfs pull -I "datasets/fineweb10B_sp4096/*"
 git lfs pull -I "tokenizers/fineweb_4096_bpe.model"
+
+echo
+echo "Setup finished. Activate the venv in this shell with:"
+echo "  source ${PROJECT_ROOT}/.venv/bin/activate"

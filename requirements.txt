@@ -1,6 +1,5 @@
 numpy
 tqdm
-torch
 huggingface-hub
 kernels
 setuptools
@@ -12,3 +11,4 @@ wandb
 psutil
 packaging
 ninja
+brotli

@@ -19,7 +19,16 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch import Tensor, nn
 
-from flash_attn_interface import flash_attn_func as flash_attn_3_func
+try:
+    from flash_attn_interface import flash_attn_func as _flash_attn_3_func
+except ImportError:
+    _flash_attn_3_func = None
+
+def _use_flash_attn() -> bool:
+    if _flash_attn_3_func is None:
+        return False
+    v = os.environ.get("USE_FLASH_ATTN", "1").strip().lower()
+    return v not in ("0", "false", "no", "off")
 
 # ----------------------------------------
 # Hyperparameters
@@ -88,7 +97,7 @@ class Hyperparameters():
     adam_wd = float(os.environ.get('ADAM_WD', 0.02))
     muon_wd = float(os.environ.get('MUON_WD', 0.085))
     embed_wd = float(os.environ.get('EMBED_WD', 0.085))
-    ema_decay = float(os.environ.get('EMA_DECAY', 0.997))
+    ema_decay = float(os.environ.get('EMA_DECAY', 1.0))
 
     # Compression
     compressor = os.environ.get('COMPRESSOR', 'brotli')  #(lzma or brotli)
@@ -98,6 +107,9 @@ class Hyperparameters():
     codebook_reserve_seconds = float(os.environ.get("CODEBOOK_RESERVE_SECONDS", 10.0))
     codebook_hessian_damp = float(os.environ.get("CODEBOOK_HESSIAN_DAMP", 0.01))
     codebook_lattice_scale = float(os.environ.get("CODEBOOK_LATTICE_SCALE", 1.03))
+    codebook_scale_bits = int(os.environ.get("CODEBOOK_SCALE_BITS", 8))
+    codebook_entropy_summary_topk = int(os.environ.get("CODEBOOK_ENTROPY_SUMMARY_TOPK", 12))
+    codebook_entropy_focus = os.environ.get("CODEBOOK_ENTROPY_FOCUS", "").strip()
 
     # Distributed setup
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
@@ -512,7 +524,10 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin, self.rope_dims)
         k = apply_rotary_emb(k, cos, sin, self.rope_dims)
         q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
-        y = flash_attn_3_func(q, k, v, causal=True)
+        if _use_flash_attn():
+            y = _flash_attn_3_func(q, k, v, causal=True)
+        else:
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         if self.use_xsa:
             y = self._xsa_efficient(y, v)
         y = y.reshape(bsz, seqlen, dim)
@@ -915,6 +930,8 @@ def _validate_codebook_hparams(h: Hyperparameters) -> None:
         )
     if h.codebook_lattice_scale <= 0:
         raise ValueError(f"CODEBOOK_LATTICE_SCALE must be positive, got {h.codebook_lattice_scale}")
+    if h.codebook_scale_bits <= 0 or h.codebook_scale_bits > 16:
+        raise ValueError(f"CODEBOOK_SCALE_BITS must be in [1, 16], got {h.codebook_scale_bits}")
 
 
 def _blockify_weight(t: Tensor, block_dim: int) -> tuple[Tensor, tuple[int, int]]:
@@ -1281,6 +1298,48 @@ def _metric_optimal_scales(rotated_blocks: Tensor, codebook_blocks: Tensor, metr
     return scales.clamp(max=max_fp16).unsqueeze(-1)
 
 
+@torch.no_grad()
+def _metric_optimal_e8p_codewords(
+    rotated_blocks: Tensor,
+    metrics: Tensor,
+    lattice_scale: float,
+    *,
+    candidate_batch_size: int = 4096,
+) -> tuple[Tensor, Tensor]:
+    if rotated_blocks.ndim != 3:
+        raise ValueError(f"Expected rotated blocks with shape [rows, positions, dim], got {tuple(rotated_blocks.shape)}")
+    expected_metrics_shape = (rotated_blocks.shape[1], rotated_blocks.shape[2], rotated_blocks.shape[2])
+    if metrics.ndim != 3 or metrics.shape != expected_metrics_shape:
+        raise ValueError(f"Expected metrics with shape {expected_metrics_shape}, got {tuple(metrics.shape)}")
+    codebook = _get_e8p_codebook(rotated_blocks.device)
+    candidates = codebook.grid.to(dtype=torch.float32) / float(lattice_scale)
+    num_rows, num_positions, _ = rotated_blocks.shape
+    selected_idx = torch.empty((num_rows, num_positions), device=rotated_blocks.device, dtype=torch.long)
+    selected_codewords = torch.empty_like(rotated_blocks, dtype=torch.float32)
+    for pos in range(num_positions):
+        metric = metrics[pos]
+        x = rotated_blocks[:, pos, :].to(dtype=torch.float32)
+        x_metric = torch.matmul(x, metric)
+        best_improvement = torch.full((num_rows,), -torch.inf, device=x.device, dtype=torch.float32)
+        best_idx = torch.zeros((num_rows,), device=x.device, dtype=torch.long)
+        for start in range(0, candidates.shape[0], candidate_batch_size):
+            cand = candidates[start:start + candidate_batch_size]
+            cand_metric = torch.matmul(cand, metric)
+            numer = torch.matmul(x_metric, cand.t())
+            denom = (cand_metric * cand).sum(dim=-1).clamp_min(1e-8)
+            # x^T M x is candidate-independent, so minimizing the optimal metric error is
+            # equivalent to maximizing the gain from the best non-negative scale.
+            improvement = numer.clamp_min(0.0).square() / denom.unsqueeze(0)
+            chunk_best_improvement, chunk_best_idx = improvement.max(dim=1)
+            update = chunk_best_improvement > best_improvement
+            if update.any():
+                best_improvement = torch.where(update, chunk_best_improvement, best_improvement)
+                best_idx = torch.where(update, start + chunk_best_idx, best_idx)
+        selected_idx[:, pos] = best_idx
+        selected_codewords[:, pos, :] = candidates.index_select(0, best_idx)
+    return selected_codewords, selected_idx
+
+
 class CodebookQuantizer:
     def __init__(self, h: Hyperparameters, model: nn.Module):
         _validate_codebook_hparams(h)
@@ -1306,12 +1365,6 @@ class CodebookQuantizer:
         sign_vec = _hadamard_sign_vector(name, self.h.codebook_block_dim, device=blocks.device, dtype=torch.float32)
         rotated_blocks = hadamard_rotate_blocks(blocks, sign_vec, enabled=self.h.codebook_use_hadamard)
         rotated_grid = rotated_blocks.view(num_rows, num_positions, self.h.codebook_block_dim)
-        target_dirs, _ = normalize_blocks(rotated_grid)
-        fixed_dirs_flat, fixed_idx = _quantize_e8p_blocks(
-            target_dirs.reshape(-1, self.h.codebook_block_dim),
-            self.h.codebook_lattice_scale,
-        )
-        fixed_dirs = fixed_dirs_flat.view(num_rows, num_positions, self.h.codebook_block_dim)
         metrics = _block_metrics_from_hessian(
             shape,
             self.h.codebook_block_dim,
@@ -1320,6 +1373,11 @@ class CodebookQuantizer:
             use_hadamard=self.h.codebook_use_hadamard,
             damp_factor=self.h.codebook_hessian_damp,
             device=blocks.device,
+        )
+        fixed_dirs, fixed_idx = _metric_optimal_e8p_codewords(
+            rotated_grid,
+            metrics,
+            self.h.codebook_lattice_scale,
         )
         scales = _metric_optimal_scales(rotated_grid, fixed_dirs, metrics)
         scales_fp16 = scales.to(dtype=torch.float16)
@@ -1343,7 +1401,7 @@ class CodebookQuantizer:
         self.states[name] = {
             "shape": shape,
             "block_dim": self.h.codebook_block_dim,
-            "fixed_idx": fixed_idx.to(dtype=torch.uint16).cpu().contiguous(),
+            "fixed_idx": fixed_idx.reshape(-1).to(dtype=torch.uint16).cpu().contiguous(),
             "scales": scales_fp16.reshape(-1).cpu().contiguous(),
             "stats": stats,
         }
@@ -1399,18 +1457,20 @@ class CodebookQuantizer:
                 state = self.states[name]
                 idx = state["fixed_idx"]
                 scales = state["scales"]
+                scale_payload, scale_meta = _quantize_codebook_scales(scales, self.h.codebook_scale_bits)
                 result[name + ".idx"] = idx
-                result[name + ".scale"] = scales
+                result[name + ".scale"] = scale_payload
                 meta[name] = {
-                    "type": "codebook_e8p_fp16_scale",
+                    "type": "codebook_e8p",
                     "shape": list(state["shape"]),
                     "block_dim": int(state["block_dim"]),
                     "hadamard": bool(self.h.codebook_use_hadamard),
                     "lattice_scale": float(self.h.codebook_lattice_scale),
+                    **scale_meta,
                 }
                 payload_bytes = (
                     idx.numel() * idx.element_size()
-                    + scales.numel() * scales.element_size()
+                    + scale_payload.numel() * scale_payload.element_size()
                 )
                 total_payload_bytes += payload_bytes
                 target_payload_bytes += payload_bytes
@@ -1418,8 +1478,21 @@ class CodebookQuantizer:
                 export_stats["tensors"][name] = {
                     **state["stats"],
                     "payload_bytes": payload_bytes,
+                    "scale_bits": int(scale_meta["scale_bits"]),
+                    "scale_format": str(scale_meta["scale_format"]),
                     "bpw": (8.0 * payload_bytes) / max(float(state["stats"]["num_weights"]), 1.0),
                 }
+                export_stats.setdefault("diagnostics", []).append(
+                    _codebook_payload_diagnostics(
+                        name,
+                        idx,
+                        scales,
+                        scale_payload,
+                        tuple(int(x) for x in state["shape"]),
+                        int(state["block_dim"]),
+                        self.h.compressor,
+                    )
+                )
                 continue
 
             if not t.is_floating_point() or t.numel() <= 65536:
@@ -1496,12 +1569,15 @@ def dequantize_state_dict_codebook(
                 dtype=orig.dtype,
             )
             continue
-        if info.get("type") != "codebook_e8p_fp16_scale":
+        if info.get("type") not in ("codebook_e8p_fp16_scale", "codebook_e8p"):
             raise ValueError(f"Unsupported compression metadata for {name}: {info!r}")
         shape = tuple(int(x) for x in info["shape"])
         block_dim = int(info["block_dim"])
         idx = result[name + ".idx"].to(dtype=torch.int64)
-        scales = result[name + ".scale"].to(dtype=torch.float32).view(-1, 1)
+        if info.get("type") == "codebook_e8p_fp16_scale":
+            scales = result[name + ".scale"].to(dtype=torch.float32).view(-1, 1)
+        else:
+            scales = _dequantize_codebook_scales(result[name + ".scale"], info)
         fixed_blocks = _decode_e8p_blocks(
             idx,
             float(info["lattice_scale"]),
@@ -1579,6 +1655,241 @@ def _decompress(data: bytes, compressor: str, byte_shuffle: bool = True) -> byte
     return raw
 
 
+def _codebook_scale_dtype(bits: int) -> torch.dtype:
+    return torch.uint8 if bits <= 8 else torch.uint16
+
+
+@torch.no_grad()
+def _quantize_codebook_scales(scales: Tensor, bits: int) -> tuple[Tensor, dict[str, object]]:
+    scales_fp32 = scales.to(dtype=torch.float32).clamp_min(1e-12)
+    if bits >= 16:
+        return scales.to(dtype=torch.float16).contiguous(), {
+            "scale_format": "fp16",
+            "scale_bits": 16,
+        }
+
+    levels = (1 << bits) - 1
+    log_scales = torch.log2(scales_fp32)
+    log_min = float(log_scales.min().item())
+    log_max = float(log_scales.max().item())
+    if log_max <= log_min:
+        scale_codes = torch.zeros_like(scales_fp32, dtype=_codebook_scale_dtype(bits))
+        log_step = 0.0
+    else:
+        log_step = (log_max - log_min) / levels
+        scale_codes = torch.round((log_scales - log_min) / log_step).clamp_(0, levels).to(_codebook_scale_dtype(bits))
+    return scale_codes.contiguous().cpu(), {
+        "scale_format": "log",
+        "scale_bits": int(bits),
+        "scale_log_min": log_min,
+        "scale_log_step": float(log_step),
+    }
+
+
+@torch.no_grad()
+def _dequantize_codebook_scales(scale_payload: Tensor, info: dict[str, object]) -> Tensor:
+    scale_format = str(info.get("scale_format", "fp16"))
+    if scale_format == "fp16":
+        return scale_payload.to(dtype=torch.float32).view(-1, 1)
+    if scale_format != "log":
+        raise ValueError(f"Unsupported codebook scale format: {scale_format!r}")
+    log_min = float(info["scale_log_min"])
+    log_step = float(info["scale_log_step"])
+    if log_step == 0.0:
+        return torch.full(
+            (scale_payload.numel(), 1),
+            2.0 ** log_min,
+            dtype=torch.float32,
+        )
+    logs = log_min + scale_payload.to(dtype=torch.float32).reshape(-1, 1) * log_step
+    return torch.pow(2.0, logs)
+
+
+
+
+def _entropy_from_counts(counts: np.ndarray) -> float:
+    total = int(counts.sum())
+    if total <= 0:
+        return 0.0
+    probs = counts[counts > 0].astype(np.float64) / float(total)
+    return float(-(probs * np.log2(probs)).sum())
+
+
+def _entropy_from_u8_bytes(data: bytes) -> float:
+    if not data:
+        return 0.0
+    arr = np.frombuffer(data, dtype=np.uint8)
+    counts = np.bincount(arr, minlength=256)
+    return _entropy_from_counts(counts)
+
+
+def _adjacent_corrcoef(arr: np.ndarray) -> float:
+    if arr.size < 2:
+        return 1.0
+    x0 = arr[:-1].astype(np.float64, copy=False)
+    x1 = arr[1:].astype(np.float64, copy=False)
+    x0 = x0 - x0.mean()
+    x1 = x1 - x1.mean()
+    denom = math.sqrt(float(np.dot(x0, x0) * np.dot(x1, x1)))
+    if denom <= 0.0:
+        return 1.0
+    return float(np.dot(x0, x1) / denom)
+
+
+def _codebook_payload_diagnostics(
+    name: str,
+    idx: Tensor,
+    scales: Tensor,
+    scale_payload: Tensor,
+    shape: tuple[int, int],
+    block_dim: int,
+    compressor: str,
+) -> dict[str, float | int | str]:
+    idx_np = idx.contiguous().numpy().reshape(-1).astype(np.uint16, copy=False)
+    scales_np = scales.contiguous().numpy().reshape(-1).astype(np.float16, copy=False)
+    scale_payload_np = scale_payload.contiguous().numpy().reshape(-1)
+    idx_bytes = idx_np.tobytes()
+    scale_bytes = scale_payload_np.tobytes()
+    combined_bytes = idx_bytes + scale_bytes
+
+    idx_counts = np.bincount(idx_np.astype(np.int64, copy=False), minlength=1 << 16)
+    idx_entropy_bits = _entropy_from_counts(idx_counts)
+    idx_unique = int(np.count_nonzero(idx_counts))
+
+    scale_words = scales_np.view(np.uint16)
+    _, scale_counts = np.unique(scale_words, return_counts=True)
+    scale_value_entropy_bits = _entropy_from_counts(scale_counts)
+
+    scale_grid = scales_np.astype(np.float32, copy=False).reshape(shape[0], shape[1] // block_dim)
+    if scale_grid.shape[1] > 1:
+        scale_deltas = np.diff(scale_grid, axis=1).astype(np.float16, copy=False).reshape(-1)
+        scale_delta_words = scale_deltas.view(np.uint16)
+        _, delta_counts = np.unique(scale_delta_words, return_counts=True)
+        scale_delta_entropy_bits = _entropy_from_counts(delta_counts)
+        scale_delta_mean_abs = float(np.mean(np.abs(scale_deltas.astype(np.float32, copy=False))))
+        scale_adjacent_corr = _adjacent_corrcoef(scale_grid.reshape(-1))
+        scale_relative_delta = scale_delta_mean_abs / max(float(np.mean(np.abs(scale_grid))), 1e-12)
+    else:
+        scale_delta_entropy_bits = 0.0
+        scale_delta_mean_abs = 0.0
+        scale_adjacent_corr = 1.0
+        scale_relative_delta = 0.0
+
+    idx_compressed_bytes = len(_compress(idx_bytes, compressor))
+    scale_compressed_bytes = len(_compress(scale_bytes, compressor))
+    combined_compressed_bytes = len(_compress(combined_bytes, compressor))
+    idx_byte_entropy = _entropy_from_u8_bytes(_byte_shuffle(idx_bytes))
+    scale_byte_entropy = _entropy_from_u8_bytes(_byte_shuffle(scale_bytes))
+
+    return {
+        "name": name,
+        "idx_unique": idx_unique,
+        "idx_entropy_bits": idx_entropy_bits,
+        "idx_byte_entropy_bits": idx_byte_entropy,
+        "idx_raw_bytes": len(idx_bytes),
+        "idx_compressed_bytes": idx_compressed_bytes,
+        "idx_entropy_bound_bytes": (idx_np.size * idx_entropy_bits) / 8.0,
+        "scale_unique": int(scale_counts.size),
+        "scale_value_entropy_bits": scale_value_entropy_bits,
+        "scale_delta_entropy_bits": scale_delta_entropy_bits,
+        "scale_byte_entropy_bits": scale_byte_entropy,
+        "scale_raw_bytes": len(scale_bytes),
+        "scale_compressed_bytes": scale_compressed_bytes,
+        "scale_entropy_bound_bytes": (scales_np.size * scale_value_entropy_bits) / 8.0,
+        "scale_delta_mean_abs": scale_delta_mean_abs,
+        "scale_relative_delta": scale_relative_delta,
+        "scale_adjacent_corr": scale_adjacent_corr,
+        "scale_storage_bits": float(8.0 * len(scale_bytes) / max(scale_payload_np.size, 1)),
+        "combined_raw_bytes": len(combined_bytes),
+        "combined_compressed_bytes": combined_compressed_bytes,
+    }
+
+
+def _select_codebook_focus_tensor(
+    diagnostics: list[dict[str, float | int | str]],
+    focus: str,
+) -> dict[str, float | int | str] | None:
+    if not diagnostics:
+        return None
+    if focus:
+        for item in diagnostics:
+            if item["name"] == focus:
+                return item
+        for item in diagnostics:
+            if focus in str(item["name"]):
+                return item
+    return max(diagnostics, key=lambda item: float(item["scale_compressed_bytes"]))
+
+
+def _log_codebook_diagnostics(h: Hyperparameters, quant_stats: dict[str, object]) -> None:
+    diagnostics = list(quant_stats.get("diagnostics", []))
+    if not diagnostics:
+        return
+    topk = max(int(h.codebook_entropy_summary_topk), 0)
+    total_idx_compressed = sum(int(item["idx_compressed_bytes"]) for item in diagnostics)
+    total_scale_compressed = sum(int(item["scale_compressed_bytes"]) for item in diagnostics)
+    total_combined_compressed = sum(int(item["combined_compressed_bytes"]) for item in diagnostics)
+    log(
+        f"codebook:entropy_summary tensors:{len(diagnostics)} "
+        f"idx_compressed_bytes:{total_idx_compressed} "
+        f"scale_compressed_bytes:{total_scale_compressed} "
+        f"combined_compressed_bytes:{total_combined_compressed}"
+    )
+    if topk > 0:
+        ranked = sorted(
+            diagnostics,
+            key=lambda item: (float(item["scale_compressed_bytes"]), float(item["combined_compressed_bytes"])),
+            reverse=True,
+        )[:topk]
+        for item in ranked:
+            log(
+                "codebook:tensor "
+                f"name:{item['name']} "
+                f"idx_raw:{item['idx_raw_bytes']} idx_zip:{item['idx_compressed_bytes']} "
+                f"scale_raw:{item['scale_raw_bytes']} scale_zip:{item['scale_compressed_bytes']} "
+                f"combined_zip:{item['combined_compressed_bytes']} "
+                f"idx_H:{float(item['idx_entropy_bits']):.3f}bits "
+                f"scale_H:{float(item['scale_value_entropy_bits']):.3f}bits "
+                f"scale_dH:{float(item['scale_delta_entropy_bits']):.3f}bits "
+                f"scale_store:{float(item['scale_storage_bits']):.1f}bits "
+                f"scale_rel_delta:{float(item['scale_relative_delta']):.5f} "
+                f"scale_corr:{float(item['scale_adjacent_corr']):.5f}"
+            )
+    focus_item = _select_codebook_focus_tensor(diagnostics, h.codebook_entropy_focus)
+    if focus_item is None:
+        return
+    log(
+        "codebook:focus "
+        f"name:{focus_item['name']} "
+        f"idx_unique:{focus_item['idx_unique']} "
+        f"idx_H:{float(focus_item['idx_entropy_bits']):.4f}bits "
+        f"idx_byte_H:{float(focus_item['idx_byte_entropy_bits']):.4f}bits "
+        f"idx_raw:{focus_item['idx_raw_bytes']} "
+        f"idx_entropy_bound:{float(focus_item['idx_entropy_bound_bytes']):.1f} "
+        f"idx_zip:{focus_item['idx_compressed_bytes']}"
+    )
+    log(
+        "codebook:focus "
+        f"name:{focus_item['name']} "
+        f"scale_unique:{focus_item['scale_unique']} "
+        f"scale_H:{float(focus_item['scale_value_entropy_bits']):.4f}bits "
+        f"scale_dH:{float(focus_item['scale_delta_entropy_bits']):.4f}bits "
+        f"scale_byte_H:{float(focus_item['scale_byte_entropy_bits']):.4f}bits "
+        f"scale_store:{float(focus_item['scale_storage_bits']):.1f}bits "
+        f"scale_raw:{focus_item['scale_raw_bytes']} "
+        f"scale_entropy_bound:{float(focus_item['scale_entropy_bound_bytes']):.1f} "
+        f"scale_zip:{focus_item['scale_compressed_bytes']}"
+    )
+    log(
+        "codebook:focus "
+        f"name:{focus_item['name']} "
+        f"combined_zip:{focus_item['combined_compressed_bytes']} "
+        f"scale_delta_mean_abs:{float(focus_item['scale_delta_mean_abs']):.6f} "
+        f"scale_rel_delta:{float(focus_item['scale_relative_delta']):.6f} "
+        f"scale_adjacent_corr:{float(focus_item['scale_adjacent_corr']):.6f}"
+    )
+
+
 def serialize(h: Hyperparameters, base_model: torch.nn.Module, code: str) -> int:
     quantizer = CodebookQuantizer(h, base_model)
     device = next(base_model.parameters()).device
@@ -1630,11 +1941,16 @@ def serialize(h: Hyperparameters, base_model: torch.nn.Module, code: str) -> int
             f"effective_payload_bpw_all_weights:{summary['effective_payload_bpw_all_weights']:.4f}"
         )
         log(
+            f"Codebook scale codec:{'fp16' if h.codebook_scale_bits >= 16 else 'log'} "
+            f"scale_bits:{h.codebook_scale_bits}"
+        )
+        log(
             f"Fallback payloads int8_weights:{summary['int8_fallback_weights']} "
             f"int8_bytes:{summary['int8_fallback_payload_bytes']} "
             f"passthrough_weights:{summary['passthrough_weights']} "
             f"passthrough_bytes:{summary['passthrough_payload_bytes']}"
         )
+        _log_codebook_diagnostics(h, quant_stats)
         log(f"Total submission size codebook+{h.compressor}: {bytes_total} bytes")
     return bytes_total
 
@@ -1897,7 +2213,8 @@ def train_model(h: Hyperparameters, device: torch.device, val_data: ValidationDa
             h.train_files, h.rank, h.world_size, device)
 
     # Training loop
-    ema_state = {name: t.detach().float().clone() for name, t in base_model.state_dict().items()}
+    use_ema = h.ema_decay < 1.0
+    ema_state = {name: t.detach().float().clone() for name, t in base_model.state_dict().items()} if use_ema else None
     ema_decay = h.ema_decay
 
     training_time_ms = 0.0
@@ -1931,9 +2248,10 @@ def train_model(h: Hyperparameters, device: torch.device, val_data: ValidationDa
         scale = lr_mul(frac)
         train_loss = step_fn(step, scale)
 
-        with torch.no_grad():
-            for name, t in base_model.state_dict().items():
-                ema_state[name].mul_(ema_decay).add_(t.detach().float(), alpha=1.0 - ema_decay)
+        if use_ema:
+            with torch.no_grad():
+                for name, t in base_model.state_dict().items():
+                    ema_state[name].mul_(ema_decay).add_(t.detach().float(), alpha=1.0 - ema_decay)
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
@@ -1962,11 +2280,11 @@ def train_model(h: Hyperparameters, device: torch.device, val_data: ValidationDa
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
 
-    # Weight averaging
-    log("ema:applying EMA weights")
-    current_state = base_model.state_dict()
-    avg_state = {name: t.to(dtype=current_state[name].dtype) for name, t in ema_state.items()}
-    base_model.load_state_dict(avg_state, strict=True)
+    if use_ema:
+        log("ema:applying EMA weights")
+        current_state = base_model.state_dict()
+        avg_state = {name: t.to(dtype=current_state[name].dtype) for name, t in ema_state.items()}
+        base_model.load_state_dict(avg_state, strict=True)
 
     return base_model, compiled_model
 
@@ -1982,7 +2300,7 @@ def train_and_eval(h: Hyperparameters, device: torch.device) -> None:
     log(f"val_tokens: {val_data.val_tokens.numel() - 1}")
 
     base_model, compiled_model = train_model(h, device, val_data)
-    timed_eval("pre-codebook post-ema", eval_val, h, device, val_data, compiled_model)
+    timed_eval("pre-codebook post-ema" if h.ema_decay < 1.0 else "pre-codebook", eval_val, h, device, val_data, compiled_model)
 
     serialize(h, base_model, Path(__file__).read_text(encoding="utf-8"))
     if h.distributed:
