@@ -9,3 +9,6 @@ datasets
 tiktoken
 sentencepiece
 wandb
+psutil
+packaging
+ninja
