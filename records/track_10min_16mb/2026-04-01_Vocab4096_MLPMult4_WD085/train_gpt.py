@@ -19,12 +19,7 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch import Tensor, nn
 
-try:
-    from flash_attn_interface import flash_attn_func as flash_attn_3_func
-    FLASH_ATTN_3_AVAILABLE = True
-except ImportError:
-    flash_attn_3_func = None
-    FLASH_ATTN_3_AVAILABLE = False
+from flash_attn_interface import flash_attn_func as flash_attn_3_func
 
 # ----------------------------------------
 # Hyperparameters
@@ -467,21 +462,6 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor, rope_dims: int = 0) ->
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
 
 
-def causal_attention(q: Tensor, k: Tensor, v: Tensor) -> Tensor:
-    if FLASH_ATTN_3_AVAILABLE:
-        return flash_attn_3_func(q, k, v, causal=True)
-
-    q = q.transpose(1, 2)
-    k = k.transpose(1, 2)
-    v = v.transpose(1, 2)
-    if k.size(1) != q.size(1):
-        repeat_factor = q.size(1) // k.size(1)
-        k = k.repeat_interleave(repeat_factor, dim=1)
-        v = v.repeat_interleave(repeat_factor, dim=1)
-    y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-    return y.transpose(1, 2)
-
-
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int,
                  rope_base: float, qk_gain_init: float, train_seq_len: int):
@@ -529,7 +509,7 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin, self.rope_dims)
         k = apply_rotary_emb(k, cos, sin, self.rope_dims)
         q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
-        y = causal_attention(q, k, v)
+        y = flash_attn_3_func(q, k, v, causal=True)
         if self.use_xsa:
             y = self._xsa_efficient(y, v)
         y = y.reshape(bsz, seqlen, dim)
@@ -1614,8 +1594,8 @@ def main():
 
     enable_cudnn_sdp(False)
     enable_flash_sdp(True)
-    enable_mem_efficient_sdp(not FLASH_ATTN_3_AVAILABLE)
-    enable_math_sdp(not FLASH_ATTN_3_AVAILABLE)
+    enable_mem_efficient_sdp(False)
+    enable_math_sdp(False)
     torch._dynamo.config.optimize_ddp = False
 
     h = Hyperparameters()
@@ -1631,8 +1611,6 @@ def main():
         log("=" * 100, console=False)
         log(f"Running Python {sys.version}", console=False)
         log(f"Running PyTorch {torch.__version__}", console=False)
-        if not FLASH_ATTN_3_AVAILABLE:
-            log("flash_attn_interface not found, using slower scaled_dot_product_attention fallback", console=True)
         log(
             subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False).stdout,
             console=False,

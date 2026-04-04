@@ -1,4 +1,5 @@
 import copy
+from dataclasses import dataclass
 import glob
 import io
 import lzma
@@ -20,7 +21,6 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch import Tensor, nn
 
 from flash_attn_interface import flash_attn_func as flash_attn_3_func
-from codebook.latticee8_padded12 import E8P12_codebook, decode_e8p_indices, quantize_blocks_to_e8p
 
 try:
     from fast_hadamard_transform import hadamard_transform as _fast_hadamard_transform
@@ -31,7 +31,7 @@ except Exception:
 
 
 def hadamard_transform(x: Tensor, scale: float = 1.0) -> Tensor:
-    if _fast_hadamard_transform is not None and x.is_cuda:
+    if _fast_hadamard_transform is not None:
         return _fast_hadamard_transform(x, scale=scale)
     original_shape = x.shape
     dim = x.shape[-1]
@@ -42,9 +42,11 @@ def hadamard_transform(x: Tensor, scale: float = 1.0) -> Tensor:
     h = 1
     while h < padded_dim:
         out = out.view(-1, padded_dim // (2 * h), 2, h)
-        a = out[:, :, 0, :]
-        b = out[:, :, 1, :]
-        out = torch.stack((a + b, a - b), dim=2).reshape(-1, padded_dim)
+        a = out[:, :, 0, :].clone()
+        b = out[:, :, 1, :].clone()
+        out[:, :, 0, :] = a + b
+        out[:, :, 1, :] = a - b
+        out = out.view(-1, padded_dim)
         h *= 2
     out = out[:, :dim]
     return (out * scale).reshape(*original_shape)
@@ -119,20 +121,21 @@ class Hyperparameters():
 
     # Compression
     compressor = os.environ.get('COMPRESSOR', 'brotli')  #(lzma or brotli)
+    codebook_start_frac = float(os.environ.get("CODEBOOK_START_FRAC", 0.75))
     codebook_block_dim = int(os.environ.get("CODEBOOK_BLOCK_DIM", 8))
-    codebook_residual_k = int(os.environ.get("CODEBOOK_RESIDUAL_K", 16))
+    codebook_k1 = int(os.environ.get("CODEBOOK_K1", 16))
+    codebook_k2 = int(os.environ.get("CODEBOOK_K2", 16))
     codebook_scale_bits = int(os.environ.get("CODEBOOK_SCALE_BITS", 6))
+    codebook_refresh_every = int(os.environ.get("CODEBOOK_REFRESH_EVERY", 1000))
     codebook_init_kmeans_iters = int(os.environ.get("CODEBOOK_INIT_KMEANS_ITERS", 8))
     codebook_refinement_iters = int(os.environ.get("CODEBOOK_REFINEMENT_ITERS", 2))
-    codebook_calibration_batches = int(os.environ.get("CODEBOOK_CALIBRATION_BATCHES", 64))
-    codebook_reserve_seconds = float(os.environ.get("CODEBOOK_RESERVE_SECONDS", 10.0))
-    codebook_hessian_damp = float(os.environ.get("CODEBOOK_HESSIAN_DAMP", 0.01))
-    codebook_lattice_scale = float(os.environ.get("CODEBOOK_LATTICE_SCALE", 1.03))
-    codebook_ldlq_iters = int(os.environ.get("CODEBOOK_LDLQ_ITERS", 2))
-    codebook_ldlq_topk = int(os.environ.get("CODEBOOK_LDLQ_TOPK", 4))
-    codebook_outlier_frac = float(os.environ.get("CODEBOOK_OUTLIER_FRAC", 0.01))
-    codebook_outlier_max_blocks = int(os.environ.get("CODEBOOK_OUTLIER_MAX_BLOCKS", 4096))
-    codebook_debug_topk = int(os.environ.get("CODEBOOK_DEBUG_TOPK", 4))
+    codebook_export_refinement_iters = int(os.environ.get("CODEBOOK_EXPORT_REFINEMENT_ITERS", 8))
+    codebook_debug_every = int(os.environ.get("CODEBOOK_DEBUG_EVERY", 1000))
+    codebook_qat_enabled = bool(int(os.environ.get("CODEBOOK_QAT_ENABLED", "1")))
+    codebook_qat_start_frac = float(os.environ.get("CODEBOOK_QAT_START_FRAC", os.environ.get("CODEBOOK_START_FRAC", 0.75)))
+    codebook_exact_assignment = bool(int(os.environ.get("CODEBOOK_EXACT_ASSIGNMENT", "1")))
+    codebook_lr = float(os.environ.get("CODEBOOK_LR", 0.005))
+    codebook_wd = float(os.environ.get("CODEBOOK_WD", 0.0))
 
     # Distributed setup
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
@@ -449,9 +452,16 @@ class RMSNorm(nn.Module):
 class CastedLinear(nn.Linear):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.codebook_qat: nn.Module | None = None
 
     def forward(self, x: Tensor) -> Tensor:
         w = self.weight.to(x.dtype)
+        if self.codebook_qat is not None and getattr(self.codebook_qat, "active", False):
+            w_q = self.codebook_qat.quantized_weight(self.weight).to(x.dtype)
+            if self.training:
+                w = w + (w_q - w).detach()
+            else:
+                w = w_q
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, w, bias)
 
@@ -794,16 +804,19 @@ class Muon(torch.optim.Optimizer):
 class Optimizers():
     def __init__(self, h: Hyperparameters, base_model: GPT):
         block_named_params = list(base_model.blocks.named_parameters())
+        codebook_params = [p for name, p in block_named_params if ".codebook_qat." in name]
         matrix_params = [
             p
             for name, p in block_named_params
             if p.ndim == 2
+            and ".codebook_qat." not in name
             and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
         ]
         scalar_params = [
             p
             for name, p in block_named_params
             if (p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS))
+            and ".codebook_qat." not in name
         ]
         if base_model.skip_weights.numel() > 0:
             scalar_params.append(base_model.skip_weights)
@@ -844,6 +857,17 @@ class Optimizers():
             fused=True,
         )
         self.optimizers: list[torch.optim.Optimizer] = [self.optimizer_tok, self.optimizer_muon, self.optimizer_scalar]
+        if codebook_params:
+            self.optimizer_codebook = torch.optim.AdamW(
+                [{"params": codebook_params, "lr": h.codebook_lr, "base_lr": h.codebook_lr}],
+                betas=(h.beta1, h.beta2),
+                eps=h.adam_eps,
+                weight_decay=h.codebook_wd,
+                fused=True,
+            )
+            self.optimizers.append(self.optimizer_codebook)
+        else:
+            self.optimizer_codebook = None
         if base_model.lm_head is not None:
             self.optimizer_head = torch.optim.Adam(
                 [{"params": [base_model.lm_head.weight], "lr": h.head_lr, "base_lr": h.head_lr}],
@@ -879,67 +903,6 @@ def restore_fp32_params(model: nn.Module) -> None:
     for name, param in model.named_parameters():
         if (param.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and param.dtype != torch.float32:
             param.data = param.data.float()
-
-
-def collect_hessians(
-    model: nn.Module,
-    train_loader: DistributedTokenLoader,
-    h: Hyperparameters,
-    device: torch.device,
-    target_names: set[str],
-    n_calibration_batches: int,
-) -> dict[str, Tensor]:
-    """Collect X^T X activation covariances for the target linear weights."""
-    if n_calibration_batches <= 0 or not target_names:
-        return {}
-    hessians: dict[str, Tensor] = {}
-    hooks = []
-    was_training = model.training
-
-    def make_hook(name: str):
-        def hook_fn(module, inputs, output):
-            x = inputs[0].detach().float()
-            if x.ndim == 3:
-                x = x.reshape(-1, x.shape[-1])
-            if name not in hessians:
-                hessians[name] = torch.zeros(
-                    x.shape[1],
-                    x.shape[1],
-                    dtype=torch.float32,
-                    device=device,
-                )
-            hessians[name].addmm_(x.t(), x)
-        return hook_fn
-
-    for module_name, module in model.named_modules():
-        if not isinstance(module, CastedLinear):
-            continue
-        weight_name = f"{module_name}.weight"
-        if weight_name in target_names:
-            hooks.append(module.register_forward_hook(make_hook(weight_name)))
-
-    model.eval()
-    with torch.no_grad():
-        for _ in range(n_calibration_batches):
-            x, _ = train_loader.next_batch(
-                h.train_batch_tokens,
-                h.train_seq_len,
-                h.grad_accum_steps,
-            )
-            model.forward_logits(x)
-
-    for hook in hooks:
-        hook.remove()
-
-    world = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
-    for name, hessian in hessians.items():
-        if world > 1:
-            dist.all_reduce(hessian, op=dist.ReduceOp.SUM)
-        hessians[name] = hessian.cpu() / float(max(world * n_calibration_batches, 1))
-
-    if was_training:
-        model.train()
-    return hessians
 
 
 CONTROL_TENSOR_NAME_PATTERNS = tuple(
@@ -989,7 +952,7 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
 
 def _blockify_weight(t: Tensor, block_dim: int) -> tuple[Tensor, tuple[int, ...]]:
     if t.ndim != 2:
-        raise ValueError(f"Codebook block quantization expects a 2D tensor, got shape {tuple(t.shape)}")
+        raise ValueError(f"Hadamard block rotation expects a 2D tensor, got shape {tuple(t.shape)}")
     if t.shape[1] % block_dim != 0:
         raise ValueError(
             f"Tensor shape {tuple(t.shape)} is not compatible with CODEBOOK_BLOCK_DIM={block_dim}"
@@ -1048,6 +1011,78 @@ def codebook_lookup(indices: Tensor, codebook: Tensor) -> Tensor:
     return codebook.index_select(0, indices.long())
 
 
+def kmeans_update(
+    points: Tensor,
+    indices: Tensor,
+    k: int,
+    prev_centroids: Tensor | None = None,
+) -> tuple[Tensor, Tensor]:
+    d = points.shape[1]
+    centroids = torch.zeros(k, d, device=points.device, dtype=points.dtype)
+    counts = torch.zeros(k, device=points.device, dtype=torch.float32)
+    centroids.index_add_(0, indices, points)
+    counts.index_add_(0, indices, torch.ones(indices.shape[0], device=points.device, dtype=torch.float32))
+    mask = counts > 0
+    if mask.any():
+        centroids[mask] /= counts[mask].unsqueeze(-1)
+    if prev_centroids is not None and (~mask).any():
+        centroids[~mask] = prev_centroids[~mask]
+    return centroids, counts
+
+
+def _sample_init_centroids(points: Tensor, k: int, name: str, stage: str) -> Tensor:
+    n = points.shape[0]
+    if n <= 0:
+        raise ValueError(f"Cannot initialize codebook for {name}: no points")
+    rng = random.Random(f"codebook::{name}::{stage}")
+    if n >= k:
+        sample_idx = rng.sample(range(n), k)
+    else:
+        sample_idx = [rng.randrange(n) for _ in range(k)]
+    indices = torch.tensor(sample_idx, device=points.device, dtype=torch.long)
+    return points.index_select(0, indices).clone()
+
+
+def run_lloyd_kmeans(points: Tensor, k: int, iters: int, name: str, stage: str) -> Tensor:
+    centroids = _sample_init_centroids(points, k, name, stage)
+    for _ in range(max(iters, 1)):
+        indices = nearest_codeword(points, centroids)
+        centroids, _ = kmeans_update(points, indices, k, prev_centroids=centroids)
+    return centroids
+
+
+def residual_vq_assign(x: Tensor, codebook1: Tensor, codebook2: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    idx1 = nearest_codeword(x, codebook1)
+    q1 = codebook_lookup(idx1, codebook1)
+    residual = x - q1
+    idx2 = nearest_codeword(residual, codebook2)
+    q2 = codebook_lookup(idx2, codebook2)
+    return idx1, idx2, q1, q2, residual
+
+
+def exact_pair_vq_assign(x: Tensor, codebook1: Tensor, codebook2: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    pair_codebook = (codebook1[:, None, :] + codebook2[None, :, :]).reshape(-1, x.shape[-1])
+    pair_idx = nearest_codeword(x, pair_codebook)
+    idx1 = torch.div(pair_idx, codebook2.shape[0], rounding_mode="floor")
+    idx2 = torch.remainder(pair_idx, codebook2.shape[0])
+    q1 = codebook_lookup(idx1, codebook1)
+    q2 = codebook_lookup(idx2, codebook2)
+    residual = x - q1
+    return idx1, idx2, q1, q2, residual
+
+
+def assign_codeword_pairs(
+    x: Tensor,
+    codebook1: Tensor,
+    codebook2: Tensor,
+    *,
+    exact: bool,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    if exact:
+        return exact_pair_vq_assign(x, codebook1, codebook2)
+    return residual_vq_assign(x, codebook1, codebook2)
+
+
 def _bits_for_size(size: int) -> int:
     if size <= 0:
         raise ValueError(f"Expected positive size, got {size}")
@@ -1055,23 +1090,23 @@ def _bits_for_size(size: int) -> int:
 
 
 def _pack_codes(codes: Tensor, bits: int) -> Tensor:
-    if not 1 <= bits <= 32:
-        raise ValueError(f"Only 1..32 bit packing is supported, got {bits}")
-    codes_np = codes.detach().view(-1).cpu().numpy().astype(np.uint64, copy=False)
-    bitplanes = ((codes_np[:, None] >> np.arange(bits, dtype=np.uint64)) & 1).astype(np.uint8, copy=False)
+    if not 1 <= bits <= 8:
+        raise ValueError(f"Only 1..8 bit packing is supported, got {bits}")
+    codes_np = codes.detach().view(-1).cpu().numpy().astype(np.uint16, copy=False)
+    bitplanes = ((codes_np[:, None] >> np.arange(bits, dtype=np.uint16)) & 1).astype(np.uint8, copy=False)
     packed = np.packbits(bitplanes.reshape(-1), bitorder="little")
     return torch.from_numpy(packed.copy())
 
 
 def _unpack_codes(packed: Tensor, bits: int, count: int) -> Tensor:
-    if not 1 <= bits <= 32:
-        raise ValueError(f"Only 1..32 bit packing is supported, got {bits}")
+    if not 1 <= bits <= 8:
+        raise ValueError(f"Only 1..8 bit packing is supported, got {bits}")
     if count == 0:
         return torch.empty((0,), dtype=torch.long)
     packed_np = packed.detach().view(-1).cpu().numpy().astype(np.uint8, copy=False)
     bits_np = np.unpackbits(packed_np, bitorder="little")[: count * bits].reshape(count, bits)
-    weights = (1 << np.arange(bits, dtype=np.uint64)).reshape(1, bits)
-    codes_np = (bits_np.astype(np.uint64, copy=False) * weights).sum(axis=1)
+    weights = (1 << np.arange(bits, dtype=np.uint32)).reshape(1, bits)
+    codes_np = (bits_np.astype(np.uint32, copy=False) * weights).sum(axis=1)
     return torch.from_numpy(codes_np.astype(np.int64, copy=False))
 
 
@@ -1112,185 +1147,201 @@ def dequantize_log_scales(
     return logs.exp().to(dtype=dtype).unsqueeze(-1)
 
 
-_E8P_CODEBOOK_CACHE: dict[str, nn.Module] = {}
-
-
-def _e8p_cache_key(device: torch.device | None) -> str:
-    if device is None:
-        return "cpu"
-    return f"{device.type}:{device.index}"
-
-
-def _get_e8p_codebook(device: torch.device | None) -> nn.Module:
-    key = _e8p_cache_key(device)
-    cached = _E8P_CODEBOOK_CACHE.get(key)
-    if cached is not None:
-        return cached
-    codebook = E8P12_codebook(inference=False)
-    if device is not None:
-        codebook = codebook.to(device=device, dtype=torch.float32)
-    else:
-        codebook = codebook.to(dtype=torch.float32)
-    codebook.eval()
-    _E8P_CODEBOOK_CACHE[key] = codebook
-    return codebook
-
-
-@torch.no_grad()
-def _quantize_e8p_blocks(blocks: Tensor, lattice_scale: float) -> tuple[Tensor, Tensor]:
-    codebook = _get_e8p_codebook(blocks.device)
-    vals, idxs = quantize_blocks_to_e8p(
-        blocks,
-        codebook=codebook,
-        scale=lattice_scale,
-        return_idx=True,
-    )
-    return vals.to(device=blocks.device, dtype=torch.float32), idxs.to(device=blocks.device, dtype=torch.long)
-
-
-@torch.no_grad()
-def _decode_e8p_blocks(
-    idxs: Tensor,
-    lattice_scale: float,
-    *,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> Tensor:
-    codebook = _get_e8p_codebook(device)
-    return decode_e8p_indices(idxs.to(device=device), codebook=codebook, scale=lattice_scale, dtype=dtype)
-
-
-def _weighted_sample_init_centroids(
-    points: Tensor,
-    weights: Tensor,
-    k: int,
-    name: str,
-    stage: str,
-) -> Tensor:
-    n = points.shape[0]
-    if n <= 0:
-        raise ValueError(f"Cannot initialize codebook for {name}: no points")
-    probs = weights.detach().float().cpu().clamp_min(0)
-    if float(probs.sum().item()) <= 0.0:
-        probs = torch.ones_like(probs)
-    probs = probs / probs.sum()
-    seed = random.Random(f"codebook::{name}::{stage}").randrange(1 << 31)
-    generator = torch.Generator(device="cpu")
-    generator.manual_seed(seed)
-    sampled = torch.multinomial(probs, k, replacement=n < k, generator=generator)
-    return points.index_select(0, sampled.to(device=points.device))
-
-
-def weighted_kmeans_update(
-    points: Tensor,
-    weights: Tensor,
-    indices: Tensor,
-    k: int,
-    prev_centroids: Tensor | None = None,
-) -> tuple[Tensor, Tensor]:
-    d = points.shape[1]
-    centroids = torch.zeros(k, d, device=points.device, dtype=points.dtype)
-    counts = torch.zeros(k, device=points.device, dtype=torch.float32)
-    centroids.index_add_(0, indices, points * weights.unsqueeze(-1))
-    counts.index_add_(0, indices, weights)
-    mask = counts > 0
-    if mask.any():
-        centroids[mask] /= counts[mask].unsqueeze(-1)
-    if prev_centroids is not None and (~mask).any():
-        centroids[~mask] = prev_centroids[~mask]
-    return centroids, counts
-
-
-def run_weighted_lloyd_kmeans(
-    points: Tensor,
-    weights: Tensor,
-    k: int,
-    iters: int,
-    name: str,
-    stage: str,
-) -> Tensor:
-    centroids = _weighted_sample_init_centroids(points, weights, k, name, stage)
-    for _ in range(max(iters, 1)):
-        indices = nearest_codeword(points, centroids)
-        centroids, _ = weighted_kmeans_update(points, weights, indices, k, prev_centroids=centroids)
-    return centroids
-
-
-def dequantize_int8_rows(q: Tensor, s: Tensor, *, device: torch.device, dtype: torch.dtype) -> Tensor:
-    return (q.to(device=device, dtype=torch.float32) * s.to(device=device, dtype=torch.float32).view(-1, 1)).to(dtype=dtype)
-
-
 def _validate_codebook_hparams(h: Hyperparameters) -> None:
     if not _is_power_of_two(h.codebook_block_dim):
         raise ValueError(f"CODEBOOK_BLOCK_DIM must be a power of 2, got {h.codebook_block_dim}")
-    if h.codebook_block_dim != 8:
-        raise ValueError(
-            f"This hybrid E8P path requires CODEBOOK_BLOCK_DIM=8, got {h.codebook_block_dim}"
-        )
-    if h.codebook_residual_k <= 0 or h.codebook_residual_k > 256:
-        raise ValueError(f"CODEBOOK_RESIDUAL_K must be in [1, 256], got {h.codebook_residual_k}")
+    if not (0.0 <= h.codebook_start_frac <= 1.0):
+        raise ValueError(f"CODEBOOK_START_FRAC must be in [0, 1], got {h.codebook_start_frac}")
+    if h.codebook_k1 > 256 or h.codebook_k2 > 256:
+        raise ValueError("This implementation supports at most 256 codewords per stage")
     if not 1 <= h.codebook_scale_bits <= 8:
         raise ValueError(f"CODEBOOK_SCALE_BITS must be in [1, 8], got {h.codebook_scale_bits}")
-    if h.codebook_calibration_batches < 0:
-        raise ValueError(
-            f"CODEBOOK_CALIBRATION_BATCHES must be non-negative, got {h.codebook_calibration_batches}"
+
+
+def _codebook_raw_bits(num_blocks: int, h: Hyperparameters) -> int:
+    idx1_bits = _bits_for_size(h.codebook_k1)
+    idx2_bits = _bits_for_size(h.codebook_k2)
+    codebook_bits = (h.codebook_k1 + h.codebook_k2) * h.codebook_block_dim * 16
+    return num_blocks * (idx1_bits + idx2_bits + h.codebook_scale_bits) + codebook_bits
+
+
+@dataclass
+class CodebookTensorState:
+    name: str
+    shape: tuple[int, ...]
+    block_dim: int
+    sign_vec: Tensor
+    codebook1: Tensor
+    codebook2: Tensor
+    idx1: Tensor
+    idx2: Tensor
+    scales: Tensor
+    stats: dict[str, object]
+
+
+def _reconstruct_rotated_blocks_from_state(state: CodebookTensorState) -> Tensor:
+    idx1 = state.idx1.long()
+    idx2 = state.idx2.long()
+    q1 = codebook_lookup(idx1, state.codebook1.float())
+    q2 = codebook_lookup(idx2, state.codebook2.float())
+    return (q1 + q2) * state.scales.float()
+
+
+class ResidualCodebookQAT(nn.Module):
+    def __init__(self, name: str, weight_shape: tuple[int, ...], h: Hyperparameters):
+        super().__init__()
+        self.name = name
+        self.weight_shape = weight_shape
+        self.block_dim = h.codebook_block_dim
+        self.k1 = h.codebook_k1
+        self.k2 = h.codebook_k2
+        num_blocks = math.prod(weight_shape) // self.block_dim
+        self.codebook1 = nn.Parameter(torch.zeros(self.k1, self.block_dim, dtype=torch.float32))
+        self.codebook2 = nn.Parameter(torch.zeros(self.k2, self.block_dim, dtype=torch.float32))
+        self.log_scales = nn.Parameter(torch.zeros(num_blocks, 1, dtype=torch.float32))
+        self.register_buffer("idx1", torch.zeros(num_blocks, dtype=torch.long))
+        self.register_buffer("idx2", torch.zeros(num_blocks, dtype=torch.long))
+        self.register_buffer(
+            "sign_vec",
+            _hadamard_sign_vector(name, self.block_dim, device=torch.device("cpu"), dtype=torch.float32),
         )
-    if h.codebook_reserve_seconds < 0:
-        raise ValueError(
-            f"CODEBOOK_RESERVE_SECONDS must be non-negative, got {h.codebook_reserve_seconds}"
+        self.register_buffer("initialized_flag", torch.tensor(False, dtype=torch.bool))
+        self.register_buffer("active_flag", torch.tensor(False, dtype=torch.bool))
+
+    @property
+    def initialized(self) -> bool:
+        return bool(self.initialized_flag.item())
+
+    @property
+    def active(self) -> bool:
+        return bool(self.active_flag.item())
+
+    def set_active(self, value: bool) -> None:
+        self.active_flag.fill_(bool(value))
+
+    def scales(self) -> Tensor:
+        return self.log_scales.exp().clamp_min(1e-8)
+
+    def _rotated_blocks(self, weight: Tensor) -> Tensor:
+        blocks, _ = _blockify_weight(weight.float(), self.block_dim)
+        sign_vec = self.sign_vec.to(device=blocks.device, dtype=blocks.dtype)
+        return hadamard_rotate_blocks(blocks, sign_vec)
+
+    @torch.no_grad()
+    def initialize_from_weight(self, weight: Tensor, h: Hyperparameters) -> None:
+        rotated_blocks = self._rotated_blocks(weight)
+        normed_blocks, scales = normalize_blocks(rotated_blocks)
+        self.log_scales.copy_(scales.log().to(device=self.log_scales.device, dtype=self.log_scales.dtype))
+
+        codebook1 = run_lloyd_kmeans(normed_blocks, self.k1, h.codebook_init_kmeans_iters, self.name, "stage1")
+        idx1_seed = nearest_codeword(normed_blocks, codebook1)
+        residual_seed = normed_blocks - codebook_lookup(idx1_seed, codebook1)
+        codebook2 = run_lloyd_kmeans(residual_seed, self.k2, h.codebook_init_kmeans_iters, self.name, "stage2")
+
+        refine_iters = max(h.codebook_refinement_iters, 1)
+        for _ in range(refine_iters):
+            idx1, idx2, q1, q2, _ = assign_codeword_pairs(
+                normed_blocks,
+                codebook1,
+                codebook2,
+                exact=h.codebook_exact_assignment,
+            )
+            codebook1, _ = kmeans_update(normed_blocks - q2, idx1, self.k1, prev_centroids=codebook1)
+            codebook2, _ = kmeans_update(normed_blocks - q1, idx2, self.k2, prev_centroids=codebook2)
+
+        self.codebook1.copy_(codebook1.to(device=self.codebook1.device, dtype=self.codebook1.dtype))
+        self.codebook2.copy_(codebook2.to(device=self.codebook2.device, dtype=self.codebook2.dtype))
+        self.initialized_flag.fill_(True)
+        self.refresh_assignments(weight, exact=h.codebook_exact_assignment)
+
+    @torch.no_grad()
+    def refresh_assignments(self, weight: Tensor, *, exact: bool) -> None:
+        rotated_blocks = self._rotated_blocks(weight)
+        scales = self.scales().to(device=rotated_blocks.device, dtype=rotated_blocks.dtype)
+        normalized_target = rotated_blocks / scales
+        idx1, idx2, _, _, _ = assign_codeword_pairs(
+            normalized_target,
+            self.codebook1.to(device=rotated_blocks.device, dtype=rotated_blocks.dtype),
+            self.codebook2.to(device=rotated_blocks.device, dtype=rotated_blocks.dtype),
+            exact=exact,
         )
-    if h.codebook_hessian_damp < 0:
-        raise ValueError(
-            f"CODEBOOK_HESSIAN_DAMP must be non-negative, got {h.codebook_hessian_damp}"
+        self.idx1.copy_(idx1.to(device=self.idx1.device))
+        self.idx2.copy_(idx2.to(device=self.idx2.device))
+
+    def quantized_weight(self, weight: Tensor) -> Tensor:
+        codebook1 = self.codebook1.to(device=weight.device, dtype=torch.float32)
+        codebook2 = self.codebook2.to(device=weight.device, dtype=torch.float32)
+        scales = self.scales().to(device=weight.device, dtype=torch.float32)
+        idx1 = self.idx1.to(device=weight.device)
+        idx2 = self.idx2.to(device=weight.device)
+        rotated_blocks = (codebook_lookup(idx1, codebook1) + codebook_lookup(idx2, codebook2)) * scales
+        sign_vec = self.sign_vec.to(device=weight.device, dtype=rotated_blocks.dtype)
+        return _unblockify_weight(hadamard_unrotate_blocks(rotated_blocks, sign_vec), self.weight_shape)
+
+    @torch.no_grad()
+    def snapshot(self, weight: Tensor, h: Hyperparameters) -> CodebookTensorState:
+        rotated_blocks = self._rotated_blocks(weight)
+        scales = self.scales().to(device=rotated_blocks.device, dtype=rotated_blocks.dtype)
+        idx1 = self.idx1.to(device=rotated_blocks.device)
+        idx2 = self.idx2.to(device=rotated_blocks.device)
+        codebook1 = self.codebook1.to(device=rotated_blocks.device, dtype=rotated_blocks.dtype)
+        codebook2 = self.codebook2.to(device=rotated_blocks.device, dtype=rotated_blocks.dtype)
+        q1 = codebook_lookup(idx1, codebook1)
+        q2 = codebook_lookup(idx2, codebook2)
+        reconstructed_rotated = (q1 + q2) * scales
+        diff = rotated_blocks - reconstructed_rotated
+        mse = diff.square().mean()
+        rel_mse = mse / rotated_blocks.square().mean().clamp_min(1e-12)
+        counts1 = torch.bincount(idx1, minlength=self.k1).to(torch.float32)
+        counts2 = torch.bincount(idx2, minlength=self.k2).to(torch.float32)
+        stats: dict[str, object] = {
+            "num_weights": int(weight.numel()),
+            "num_blocks": int(idx1.numel()),
+            "raw_bits": int(_codebook_raw_bits(int(idx1.numel()), h)),
+            "mse": float(mse.item()),
+            "rmse": float(mse.sqrt().item()),
+            "rel_mse": float(rel_mse.item()),
+            "mae": float(diff.abs().mean().item()),
+            "max_abs": float(diff.abs().max().item()),
+            "scale_min": float(scales.min().item()),
+            "scale_max": float(scales.max().item()),
+            "scale_mean": float(scales.mean().item()),
+            "used1": int((counts1 > 0).sum().item()),
+            "used2": int((counts2 > 0).sum().item()),
+            "hist1": counts1.to(torch.int64).cpu().tolist(),
+            "hist2": counts2.to(torch.int64).cpu().tolist(),
+        }
+        return CodebookTensorState(
+            name=self.name,
+            shape=self.weight_shape,
+            block_dim=self.block_dim,
+            sign_vec=self.sign_vec.detach().cpu().contiguous(),
+            codebook1=self.codebook1.detach().cpu().contiguous(),
+            codebook2=self.codebook2.detach().cpu().contiguous(),
+            idx1=self.idx1.detach().to(torch.uint8).cpu().contiguous(),
+            idx2=self.idx2.detach().to(torch.uint8).cpu().contiguous(),
+            scales=scales.detach().cpu().contiguous(),
+            stats=stats,
         )
-    if h.codebook_lattice_scale <= 0:
-        raise ValueError(f"CODEBOOK_LATTICE_SCALE must be positive, got {h.codebook_lattice_scale}")
-    if h.codebook_ldlq_iters <= 0:
-        raise ValueError(f"CODEBOOK_LDLQ_ITERS must be positive, got {h.codebook_ldlq_iters}")
-    if h.codebook_ldlq_topk <= 0:
-        raise ValueError(f"CODEBOOK_LDLQ_TOPK must be positive, got {h.codebook_ldlq_topk}")
-    if not 0.0 <= h.codebook_outlier_frac <= 1.0:
-        raise ValueError(f"CODEBOOK_OUTLIER_FRAC must be in [0, 1], got {h.codebook_outlier_frac}")
-    if h.codebook_outlier_max_blocks < 0:
-        raise ValueError(
-            f"CODEBOOK_OUTLIER_MAX_BLOCKS must be non-negative, got {h.codebook_outlier_max_blocks}"
-        )
-    if h.codebook_debug_topk < 0:
-        raise ValueError(f"CODEBOOK_DEBUG_TOPK must be non-negative, got {h.codebook_debug_topk}")
 
 
-def _hybrid_base_raw_bits(num_blocks: int, h: Hyperparameters) -> int:
-    residual_idx_bits = _bits_for_size(h.codebook_residual_k)
-    residual_codebook_bits = h.codebook_residual_k * h.codebook_block_dim * 16
-    return num_blocks * (16 + residual_idx_bits + h.codebook_scale_bits) + residual_codebook_bits
-
-
-def _hybrid_fixed_raw_bits(num_blocks: int) -> int:
-    return num_blocks * 16
-
-
-def _hybrid_residual_raw_bits(num_blocks: int, h: Hyperparameters) -> int:
-    residual_idx_bits = _bits_for_size(h.codebook_residual_k)
-    residual_codebook_bits = h.codebook_residual_k * h.codebook_block_dim * 16
-    return num_blocks * (residual_idx_bits + h.codebook_scale_bits) + residual_codebook_bits
-
-
-class Codebook:
+class OnlineCodebookQuantizer:
     def __init__(self, h: Hyperparameters, model: nn.Module):
         _validate_codebook_hparams(h)
         self.h = h
-        self.states: dict[str, dict[str, object]] = {}
+        self.active = False
+        self.qat_active = False
+        self.last_refresh_step: int | None = None
+        self.num_refreshes = 0
+        self.states: dict[str, CodebookTensorState] = {}
         self.target_modules: list[tuple[str, CastedLinear]] = []
-        self.target_names: set[str] = set()
         for module_name, module in model.named_modules():
             if not isinstance(module, CastedLinear):
                 continue
             weight_name = f"{module_name}.weight"
             if _should_codebook_quantize(weight_name, module.weight, self.h):
+                module.codebook_qat = ResidualCodebookQAT(weight_name, tuple(module.weight.shape), self.h)
                 self.target_modules.append((weight_name, module))
-                self.target_names.add(weight_name)
-        if self.target_modules:
-            _get_e8p_codebook(self.target_modules[0][1].weight.device)
 
     @staticmethod
     def _tensor_group(name: str) -> str | None:
@@ -1300,56 +1351,23 @@ class Codebook:
             return "mlp"
         return None
 
-    @staticmethod
-    def _metric_stage_summary(
-        bucket: dict[str, float],
-        key: str,
-    ) -> tuple[float, float]:
-        mse = bucket[key] / max(bucket["num_weights"], 1.0)
-        return mse, math.sqrt(mse)
-
     def _aggregate_group_stats(self, items: list[tuple[str, dict[str, object]]]) -> dict[str, dict[str, float]]:
         grouped: dict[str, dict[str, float]] = {}
         for name, stats in items:
             group = self._tensor_group(name)
             if group is None:
                 continue
-            bucket = grouped.setdefault(
-                group,
-                {
-                    "fixed_sse": 0.0,
-                    "residual_sse": 0.0,
-                    "final_sse": 0.0,
-                    "num_weights": 0.0,
-                    "num_blocks": 0.0,
-                    "outlier_blocks": 0.0,
-                    "used_residual_frac_sum": 0.0,
-                    "num_tensors": 0.0,
-                },
-            )
+            bucket = grouped.setdefault(group, {"sse": 0.0, "num_weights": 0.0, "num_tensors": 0.0})
             num_weights = float(stats["num_weights"])
-            bucket["fixed_sse"] += float(stats["fixed_mse"]) * num_weights
-            bucket["residual_sse"] += float(stats["residual_mse"]) * num_weights
-            bucket["final_sse"] += float(stats["mse"]) * num_weights
+            bucket["sse"] += float(stats["mse"]) * num_weights
             bucket["num_weights"] += num_weights
-            bucket["num_blocks"] += float(stats["num_blocks"])
-            bucket["outlier_blocks"] += float(stats["outlier_blocks"])
-            bucket["used_residual_frac_sum"] += float(stats["used_residual"]) / max(float(self.h.codebook_residual_k), 1.0)
             bucket["num_tensors"] += 1.0
         summary: dict[str, dict[str, float]] = {}
         for group, bucket in grouped.items():
-            fixed_mse = bucket["fixed_sse"] / max(bucket["num_weights"], 1.0)
-            residual_mse = bucket["residual_sse"] / max(bucket["num_weights"], 1.0)
-            final_mse = bucket["final_sse"] / max(bucket["num_weights"], 1.0)
+            mse = bucket["sse"] / max(bucket["num_weights"], 1.0)
             summary[group] = {
-                "fixed_mse": fixed_mse,
-                "fixed_rmse": math.sqrt(fixed_mse),
-                "residual_mse": residual_mse,
-                "residual_rmse": math.sqrt(residual_mse),
-                "mse": final_mse,
-                "rmse": math.sqrt(final_mse),
-                "outlier_frac": bucket["outlier_blocks"] / max(bucket["num_blocks"], 1.0),
-                "used_residual_frac": bucket["used_residual_frac_sum"] / max(bucket["num_tensors"], 1.0),
+                "mse": mse,
+                "rmse": math.sqrt(mse),
                 "num_tensors": bucket["num_tensors"],
             }
         return summary
@@ -1362,594 +1380,83 @@ class Codebook:
             if stats is None:
                 continue
             parts.append(
-                f"{group}_fixed_mse:{stats['fixed_mse']:.6e} {group}_fixed_rmse:{stats['fixed_rmse']:.6e} "
-                f"{group}_residual_mse:{stats['residual_mse']:.6e} {group}_residual_rmse:{stats['residual_rmse']:.6e} "
-                f"{group}_final_mse:{stats['mse']:.6e} {group}_final_rmse:{stats['rmse']:.6e} "
-                f"{group}_outlier_frac:{stats['outlier_frac']:.4%} "
-                f"{group}_used_residual_frac:{stats['used_residual_frac']:.2%} "
+                f"{group}_mse:{stats['mse']:.6e} {group}_rmse:{stats['rmse']:.6e} "
                 f"{group}_tensors:{int(stats['num_tensors'])}"
             )
         if len(parts) > 1:
             log(" ".join(parts))
 
-    def _log_top_tensor_stats(
-        self,
-        prefix: str,
-        items: list[tuple[str, dict[str, object]]],
-        *,
-        sort_key: str = "rel_mse",
-    ) -> None:
-        if self.h.codebook_debug_topk <= 0 or not items:
+    @torch.no_grad()
+    def _refresh_tensor(self, name: str, module: CastedLinear) -> CodebookTensorState:
+        if module.codebook_qat is None:
+            raise ValueError(f"Missing codebook_qat for {name}")
+        if not module.codebook_qat.initialized:
+            module.codebook_qat.initialize_from_weight(module.weight.detach(), self.h)
+        else:
+            module.codebook_qat.refresh_assignments(module.weight.detach(), exact=self.h.codebook_exact_assignment)
+        return module.codebook_qat.snapshot(module.weight.detach(), self.h)
+
+    def maybe_refresh(self, model: nn.Module, step: int, frac: float, *, force: bool = False) -> None:
+        if not force and frac < self.h.codebook_start_frac:
             return
-        ranked = sorted(items, key=lambda item: float(item[1].get(sort_key, 0.0)), reverse=True)
-        for name, stats in ranked[: self.h.codebook_debug_topk]:
-            parts = [
-                prefix,
-                f"name:{name}",
-                f"fixed_rel_mse:{float(stats.get('fixed_rel_mse', 0.0)):.6e}",
-                f"residual_rel_mse:{float(stats.get('residual_rel_mse', 0.0)):.6e}",
-                f"final_rel_mse:{float(stats.get('rel_mse', 0.0)):.6e}",
-                f"outliers:{int(stats.get('outlier_blocks', 0))}/{int(stats.get('num_blocks', 1))}",
-                f"used_residual:{int(stats.get('used_residual', 0))}/{self.h.codebook_residual_k}",
-                f"fixed_raw_bpw:{float(stats.get('fixed_raw_bpw', 0.0)):.4f}",
-                f"residual_raw_bpw:{float(stats.get('residual_raw_bpw', 0.0)):.4f}",
-                f"outlier_raw_bpw:{float(stats.get('outlier_raw_bpw', 0.0)):.4f}",
-                f"scale_min:{float(stats.get('scale_min', 0.0)):.3e}",
-                f"scale_mean:{float(stats.get('scale_mean', 0.0)):.3e}",
-                f"scale_max:{float(stats.get('scale_max', 0.0)):.3e}",
-                f"metric_diag_mean:{float(stats.get('metric_diag_mean', 0.0)):.3e}",
-            ]
-            if "payload_bytes" in stats:
-                parts.extend(
-                    [
-                        f"payload_bytes:{int(stats['payload_bytes'])}",
-                        f"fixed_payload:{int(stats.get('fixed_payload_bytes', 0))}",
-                        f"residual_payload:{int(stats.get('residual_payload_bytes', 0))}",
-                        f"outlier_payload:{int(stats.get('outlier_payload_bytes', 0))}",
-                    ]
-                )
-            log(" ".join(parts))
-
-    def _new_state(self, name: str, weight: Tensor) -> dict[str, object]:
-        weight_shape = tuple(weight.shape)
-        block_dim = self.h.codebook_block_dim
-        num_rows, num_cols = weight_shape
-        num_positions = num_cols // block_dim
-        num_blocks = num_rows * num_positions
-        device = weight.device
-        return {
-            "name": name,
-            "shape": weight_shape,
-            "num_rows": num_rows,
-            "num_positions": num_positions,
-            "block_dim": block_dim,
-            "sign_vec": _hadamard_sign_vector(name, block_dim, device=device, dtype=torch.float32),
-            "fixed_idx": torch.zeros(num_blocks, dtype=torch.long, device=device),
-            "residual_codebook": torch.zeros(
-                self.h.codebook_residual_k,
-                block_dim,
-                dtype=torch.float32,
-                device=device,
-            ),
-            "residual_idx": torch.zeros(num_blocks, dtype=torch.long, device=device),
-            "log_scales": torch.zeros(num_blocks, 1, dtype=torch.float32, device=device),
-            "outlier_positions": torch.empty((0,), dtype=torch.long, device=device),
-            "outlier_q": torch.empty((0, block_dim), dtype=torch.int8, device=device),
-            "outlier_scale": torch.empty((0,), dtype=INT8_PER_ROW_SCALE_DTYPE, device=device),
-            "stats": {},
-        }
-
-    @staticmethod
-    def _scales(state: dict[str, object], device: torch.device, dtype: torch.dtype) -> Tensor:
-        return state["log_scales"].to(device=device, dtype=torch.float32).exp().clamp_min(1e-8).to(dtype=dtype)
-
-    @staticmethod
-    def _blockified_weight(weight: Tensor, block_dim: int) -> Tensor:
-        blocks, _ = _blockify_weight(weight.float(), block_dim)
-        return blocks
-
-    @staticmethod
-    def _block_grid(state: dict[str, object], blocks: Tensor) -> Tensor:
-        return blocks.view(int(state["num_rows"]), int(state["num_positions"]), int(state["block_dim"]))
-
-    @staticmethod
-    def _flatten_blocks(blocks: Tensor) -> Tensor:
-        return blocks.reshape(-1, blocks.shape[-1])
-
-    @staticmethod
-    def _scale_grid(state: dict[str, object], scales: Tensor) -> Tensor:
-        return scales.view(int(state["num_rows"]), int(state["num_positions"]), 1)
-
-    def _rotated_blocks(self, state: dict[str, object], weight: Tensor) -> Tensor:
-        blocks = self._blockified_weight(weight, int(state["block_dim"]))
-        sign_vec = state["sign_vec"].to(device=blocks.device, dtype=blocks.dtype)
-        return hadamard_rotate_blocks(blocks, sign_vec)
-
-    def _decode_fixed_blocks(self, state: dict[str, object], *, device: torch.device, dtype: torch.dtype) -> Tensor:
-        return _decode_e8p_blocks(
-            state["fixed_idx"].to(device=device),
-            self.h.codebook_lattice_scale,
-            device=device,
-            dtype=dtype,
-        )
-
-    def _outlier_delta(self, state: dict[str, object], *, device: torch.device, dtype: torch.dtype) -> Tensor:
-        num_blocks = int(state["num_rows"]) * int(state["num_positions"])
-        block_dim = int(state["block_dim"])
-        out = torch.zeros(num_blocks, block_dim, device=device, dtype=dtype)
-        positions = state["outlier_positions"].to(device=device)
-        if positions.numel() == 0:
-            return out
-        delta = dequantize_int8_rows(
-            state["outlier_q"],
-            state["outlier_scale"],
-            device=device,
-            dtype=dtype,
-        )
-        out.index_copy_(0, positions, delta)
-        return out
-
-    def _reconstructed_stage_blocks(
-        self,
-        state: dict[str, object],
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        fixed_blocks = self._decode_fixed_blocks(state, device=device, dtype=dtype)
-        residual_codebook = state["residual_codebook"].to(device=device, dtype=dtype)
-        residual_idx = state["residual_idx"].to(device=device)
-        residual_blocks = codebook_lookup(residual_idx, residual_codebook)
-        scales = self._scales(state, device=device, dtype=dtype)
-        fixed_rotated = fixed_blocks * scales
-        residual_rotated = (fixed_blocks + residual_blocks) * scales
-        final_rotated = residual_rotated + self._outlier_delta(state, device=device, dtype=dtype)
-        return fixed_rotated, residual_rotated, final_rotated
-
-    def _reconstructed_weight(self, state: dict[str, object], device: torch.device, dtype: torch.dtype) -> Tensor:
-        _, _, rotated_blocks = self._reconstructed_stage_blocks(state, device=device, dtype=torch.float32)
-        sign_vec = state["sign_vec"].to(device=device, dtype=rotated_blocks.dtype)
-        blocks = hadamard_unrotate_blocks(rotated_blocks, sign_vec)
-        return _unblockify_weight(blocks, tuple(state["shape"])).to(dtype=dtype)
-
-    @staticmethod
-    def _weighted_nearest_codeword(x: Tensor, codebook: Tensor, metric: Tensor) -> Tensor:
-        x_metric = x @ metric
-        codebook_metric = codebook @ metric
-        dists = (
-            (x_metric * x).sum(dim=-1, keepdim=True)
-            - 2.0 * x_metric @ codebook.t()
-            + (codebook_metric * codebook).sum(dim=-1).unsqueeze(0)
-        )
-        return dists.argmin(dim=-1)
-
-    def _metric_topk_codewords(
-        self,
-        x: Tensor,
-        codebook: Tensor,
-        metric: Tensor,
-        topk: int,
-    ) -> Tensor:
-        x_metric = x @ metric
-        codebook_metric = codebook @ metric
-        dists = (
-            (x_metric * x).sum(dim=-1, keepdim=True)
-            - 2.0 * x_metric @ codebook.t()
-            + (codebook_metric * codebook).sum(dim=-1).unsqueeze(0)
-        )
-        return torch.topk(dists, k=min(topk, codebook.shape[0]), largest=False, dim=-1).indices
-
-    def _identity_block_metrics(self, state: dict[str, object], device: torch.device) -> Tensor:
-        eye = torch.eye(int(state["block_dim"]), device=device, dtype=torch.float32)
-        return eye.unsqueeze(0).repeat(int(state["num_positions"]), 1, 1)
-
-    def _block_metrics_from_hessian(
-        self,
-        state: dict[str, object],
-        hessian: Tensor | None,
-        *,
-        device: torch.device,
-    ) -> Tensor:
-        if hessian is None:
-            return self._identity_block_metrics(state, device)
-        expected_dim = int(state["shape"][1])
-        if hessian.ndim != 2 or hessian.shape != (expected_dim, expected_dim):
-            return self._identity_block_metrics(state, device)
-        hessian_work = hessian.to(device=device, dtype=torch.float32).clone()
-        diag = hessian_work.diag()
-        dead = diag == 0
-        if dead.any():
-            hessian_work[dead, dead] = 1.0
-        damp = float(self.h.codebook_hessian_damp * hessian_work.diag().mean().clamp_min(1e-8).item())
-        hessian_work.diagonal().add_(damp)
-        block_dim = int(state["block_dim"])
-        num_positions = int(state["num_positions"])
-        sign_vec = state["sign_vec"].to(device=device, dtype=torch.float32)
-        unrotate = hadamard_unrotate_blocks(torch.eye(block_dim, device=device, dtype=torch.float32), sign_vec)
-        metrics = torch.empty(num_positions, block_dim, block_dim, device=device, dtype=torch.float32)
-        for pos in range(num_positions):
-            start = pos * block_dim
-            stop = start + block_dim
-            block_hessian = hessian_work[start:stop, start:stop]
-            block_metric = unrotate @ block_hessian @ unrotate.t()
-            block_metric = 0.5 * (block_metric + block_metric.t())
-            block_metric.diagonal().add_(1e-6)
-            metrics[pos] = block_metric
-        return metrics
-
-    def _metric_point_weights(self, metrics: Tensor, num_rows: int) -> Tensor:
-        pos_weights = metrics.diagonal(dim1=-2, dim2=-1).mean(dim=-1).clamp_min(1e-8)
-        return pos_weights.unsqueeze(0).expand(num_rows, -1).reshape(-1)
-
-    @torch.no_grad()
-    def _initialize_residual_codebook(
-        self,
-        state: dict[str, object],
-        residual_blocks: Tensor,
-        metrics: Tensor,
-    ) -> None:
-        points = self._flatten_blocks(residual_blocks)
-        weights = self._metric_point_weights(metrics, int(state["num_rows"])).to(device=points.device, dtype=torch.float32)
-        codebook = run_weighted_lloyd_kmeans(
-            points,
-            weights,
-            self.h.codebook_residual_k,
-            self.h.codebook_init_kmeans_iters,
-            str(state["name"]),
-            "residual",
-        )
-        state["residual_codebook"].copy_(
-            codebook.to(device=state["residual_codebook"].device, dtype=state["residual_codebook"].dtype)
-        )
-
-    @torch.no_grad()
-    def _assign_residual_with_scale(
-        self,
-        normalized_blocks: Tensor,
-        rotated_blocks: Tensor,
-        fixed_blocks: Tensor,
-        residual_codebook: Tensor,
-        metrics: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        rows, num_positions, block_dim = normalized_blocks.shape
-        residual_idx = torch.empty(rows, num_positions, device=normalized_blocks.device, dtype=torch.long)
-        residual_vals = torch.empty(rows, num_positions, block_dim, device=normalized_blocks.device, dtype=torch.float32)
-        scales = torch.empty(rows, num_positions, device=normalized_blocks.device, dtype=torch.float32)
-        topk = min(self.h.codebook_ldlq_topk, residual_codebook.shape[0])
-        for pos in range(num_positions):
-            metric = metrics[pos]
-            target_norm = normalized_blocks[:, pos, :] - fixed_blocks[:, pos, :]
-            topk_idx = self._metric_topk_codewords(target_norm, residual_codebook, metric, topk=topk)
-            candidates = residual_codebook[topk_idx]
-            base = fixed_blocks[:, pos, :].unsqueeze(1) + candidates
-            target_rot = rotated_blocks[:, pos, :]
-            target_metric = target_rot @ metric
-            base_metric = torch.einsum("nkd,df->nkf", base, metric)
-            numer = (target_metric.unsqueeze(1) * base).sum(dim=-1)
-            denom = (base_metric * base).sum(dim=-1).clamp_min(1e-8)
-            candidate_scales = (numer / denom).clamp_min(1e-8)
-            errors = (
-                target_metric.unsqueeze(1) * target_rot.unsqueeze(1)
-            ).sum(dim=-1) - 2.0 * candidate_scales * numer + candidate_scales.square() * denom
-            best = errors.argmin(dim=-1)
-            best_idx = topk_idx.gather(1, best.unsqueeze(-1)).squeeze(-1)
-            best_vals = residual_codebook[best_idx]
-            best_base = fixed_blocks[:, pos, :] + best_vals
-            best_numer = ((target_rot @ metric) * best_base).sum(dim=-1)
-            best_denom = ((best_base @ metric) * best_base).sum(dim=-1).clamp_min(1e-8)
-            residual_idx[:, pos] = best_idx
-            residual_vals[:, pos, :] = best_vals
-            scales[:, pos] = (best_numer / best_denom).clamp_min(1e-8)
-        return residual_idx, residual_vals, scales.unsqueeze(-1)
-
-    @torch.no_grad()
-    def _weighted_codebook_update(
-        self,
-        targets: Tensor,
-        assignments: Tensor,
-        metrics: Tensor,
-        prev_codebook: Tensor,
-    ) -> Tensor:
-        k, block_dim = prev_codebook.shape
-        eye = torch.eye(block_dim, device=targets.device, dtype=torch.float32)
-        system = eye.unsqueeze(0).repeat(k, 1, 1) * 1e-6
-        rhs = torch.zeros(k, block_dim, device=targets.device, dtype=torch.float32)
-        counts = torch.zeros(k, device=targets.device, dtype=torch.long)
-        num_positions = targets.shape[1]
-        for pos in range(num_positions):
-            metric = metrics[pos]
-            target = targets[:, pos, :]
-            assigned = assignments[:, pos]
-            for code in range(k):
-                mask = assigned == code
-                if not mask.any():
-                    continue
-                chosen = target[mask]
-                counts[code] += chosen.shape[0]
-                system[code] += metric * float(chosen.shape[0])
-                rhs[code] += (metric @ chosen.t()).sum(dim=1)
-        updated = prev_codebook.to(device=targets.device, dtype=torch.float32).clone()
-        for code in range(k):
-            if int(counts[code].item()) == 0:
-                continue
-            updated[code] = torch.linalg.solve(system[code], rhs[code])
-        return updated
-
-    @torch.no_grad()
-    def _local_assign_blocks(
-        self,
-        state: dict[str, object],
-        rotated_blocks: Tensor,
-        metrics: Tensor,
-        residual_codebook: Tensor,
-        initial_scales: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-        scales = initial_scales
-        residual_vals = torch.zeros_like(rotated_blocks)
-        fixed_idx = torch.zeros(
-            int(state["num_rows"]),
-            int(state["num_positions"]),
-            device=rotated_blocks.device,
-            dtype=torch.long,
-        )
-        fixed_vals = torch.zeros_like(rotated_blocks)
-        residual_idx = torch.zeros_like(fixed_idx)
-        for _ in range(self.h.codebook_ldlq_iters):
-            normalized_adjusted = rotated_blocks / scales - residual_vals
-            fixed_flat, fixed_idx_flat = _quantize_e8p_blocks(
-                self._flatten_blocks(normalized_adjusted),
-                self.h.codebook_lattice_scale,
-            )
-            fixed_vals = self._block_grid(state, fixed_flat)
-            fixed_idx = fixed_idx_flat.view(int(state["num_rows"]), int(state["num_positions"]))
-            normalized_blocks = rotated_blocks / scales
-            residual_idx, residual_vals, scales = self._assign_residual_with_scale(
-                normalized_blocks,
-                rotated_blocks,
-                fixed_vals,
-                residual_codebook,
-                metrics,
-            )
-        normalized_adjusted = rotated_blocks / scales - residual_vals
-        fixed_flat, fixed_idx_flat = _quantize_e8p_blocks(
-            self._flatten_blocks(normalized_adjusted),
-            self.h.codebook_lattice_scale,
-        )
-        fixed_vals = self._block_grid(state, fixed_flat)
-        fixed_idx = fixed_idx_flat.view(int(state["num_rows"]), int(state["num_positions"]))
-        normalized_blocks = rotated_blocks / scales
-        residual_idx, residual_vals, scales = self._assign_residual_with_scale(
-            normalized_blocks,
-            rotated_blocks,
-            fixed_vals,
-            residual_codebook,
-            metrics,
-        )
-        return fixed_idx, fixed_vals, residual_idx, residual_vals, scales
-
-    @staticmethod
-    def _metric_scores(diff_blocks: Tensor, metrics: Tensor) -> Tensor:
-        scores = torch.empty(diff_blocks.shape[:2], device=diff_blocks.device, dtype=torch.float32)
-        for pos in range(diff_blocks.shape[1]):
-            metric = metrics[pos]
-            diff = diff_blocks[:, pos, :]
-            scores[:, pos] = ((diff @ metric) * diff).sum(dim=-1)
-        return scores
-
-    @torch.no_grad()
-    def _select_outliers(
-        self,
-        state: dict[str, object],
-        rotated_blocks: Tensor,
-        residual_rotated: Tensor,
-        metrics: Tensor,
-    ) -> None:
-        num_blocks = int(state["num_rows"]) * int(state["num_positions"])
-        outlier_count = min(
-            self.h.codebook_outlier_max_blocks,
-            int(round(self.h.codebook_outlier_frac * num_blocks)),
-        )
-        if self.h.codebook_outlier_frac > 0.0 and outlier_count == 0 and self.h.codebook_outlier_max_blocks > 0:
-            outlier_count = 1
-        if outlier_count <= 0:
-            state["outlier_positions"] = torch.empty((0,), dtype=torch.long, device=rotated_blocks.device)
-            state["outlier_q"] = torch.empty((0, int(state["block_dim"])), dtype=torch.int8, device=rotated_blocks.device)
-            state["outlier_scale"] = torch.empty((0,), dtype=INT8_PER_ROW_SCALE_DTYPE, device=rotated_blocks.device)
+        if (
+            not force
+            and self.active
+            and self.h.codebook_refresh_every > 0
+            and self.last_refresh_step is not None
+            and step - self.last_refresh_step < self.h.codebook_refresh_every
+        ):
             return
-        diff_blocks = rotated_blocks - residual_rotated
-        scores = self._metric_scores(diff_blocks, metrics).reshape(-1)
-        topk = min(outlier_count, scores.numel())
-        positions = torch.topk(scores, k=topk, largest=True).indices
-        delta = self._flatten_blocks(diff_blocks).index_select(0, positions)
-        q, s = quantize_float_tensor(delta)
-        state["outlier_positions"] = positions.to(device=rotated_blocks.device)
-        state["outlier_q"] = q.to(device=rotated_blocks.device)
-        state["outlier_scale"] = s.view(-1).to(device=rotated_blocks.device, dtype=INT8_PER_ROW_SCALE_DTYPE)
-
-    def _outlier_raw_bits(self, state: dict[str, object]) -> int:
-        count = int(state["outlier_positions"].numel())
-        if count == 0:
-            return 0
-        num_blocks = int(state["num_rows"]) * int(state["num_positions"])
-        position_bits = _bits_for_size(num_blocks)
-        return count * (position_bits + int(state["block_dim"]) * 8 + 16)
-
-    def _state_raw_bits(self, state: dict[str, object]) -> int:
-        num_blocks = int(state["num_rows"]) * int(state["num_positions"])
-        return _hybrid_base_raw_bits(num_blocks, self.h) + self._outlier_raw_bits(state)
-
-    @torch.no_grad()
-    def _snapshot_stats(self, state: dict[str, object], weight: Tensor) -> dict[str, object]:
-        rotated_flat = self._rotated_blocks(state, weight)
-        rotated_blocks = self._block_grid(state, rotated_flat)
-        fixed_rotated, residual_rotated, final_rotated = self._reconstructed_stage_blocks(
-            state,
-            device=rotated_blocks.device,
-            dtype=torch.float32,
-        )
-        fixed_diff = rotated_blocks - self._block_grid(state, fixed_rotated)
-        residual_diff = rotated_blocks - self._block_grid(state, residual_rotated)
-        final_diff = rotated_blocks - self._block_grid(state, final_rotated)
-        fixed_mse = fixed_diff.square().mean()
-        residual_mse = residual_diff.square().mean()
-        final_mse = final_diff.square().mean()
-        energy = rotated_blocks.square().mean().clamp_min(1e-12)
-        fixed_rel_mse = fixed_mse / energy
-        residual_rel_mse = residual_mse / energy
-        final_rel_mse = final_mse / energy
-        scales = self._scales(state, device=rotated_blocks.device, dtype=torch.float32)
-        counts_residual = torch.bincount(state["residual_idx"].to(device=rotated_blocks.device), minlength=self.h.codebook_residual_k).to(torch.float32)
-        num_blocks = int(state["fixed_idx"].numel())
-        fixed_raw_bits = _hybrid_fixed_raw_bits(num_blocks)
-        residual_raw_bits = _hybrid_residual_raw_bits(num_blocks, self.h)
-        outlier_raw_bits = self._outlier_raw_bits(state)
-        return {
-            "num_weights": int(weight.numel()),
-            "num_blocks": num_blocks,
-            "raw_bits": int(fixed_raw_bits + residual_raw_bits + outlier_raw_bits),
-            "fixed_mse": float(fixed_mse.item()),
-            "fixed_rmse": float(fixed_mse.sqrt().item()),
-            "fixed_rel_mse": float(fixed_rel_mse.item()),
-            "residual_mse": float(residual_mse.item()),
-            "residual_rmse": float(residual_mse.sqrt().item()),
-            "residual_rel_mse": float(residual_rel_mse.item()),
-            "mse": float(final_mse.item()),
-            "rmse": float(final_mse.sqrt().item()),
-            "rel_mse": float(final_rel_mse.item()),
-            "mae": float(final_diff.abs().mean().item()),
-            "max_abs": float(final_diff.abs().max().item()),
-            "scale_min": float(scales.min().item()),
-            "scale_max": float(scales.max().item()),
-            "scale_mean": float(scales.mean().item()),
-            "used_residual": int((counts_residual > 0).sum().item()),
-            "outlier_blocks": int(state["outlier_positions"].numel()),
-            "fixed_raw_bits": fixed_raw_bits,
-            "fixed_raw_bpw": fixed_raw_bits / max(float(weight.numel()), 1.0),
-            "residual_raw_bits": residual_raw_bits,
-            "residual_raw_bpw": residual_raw_bits / max(float(weight.numel()), 1.0),
-            "outlier_raw_bits": outlier_raw_bits,
-            "outlier_raw_bpw": outlier_raw_bits / max(float(weight.numel()), 1.0),
-            "hist_residual": counts_residual.to(torch.int64).cpu().tolist(),
-        }
-
-    @torch.no_grad()
-    def _fit_tensor(self, name: str, module: CastedLinear, hessian: Tensor | None) -> tuple[str, dict[str, object]]:
-        state = self.states.get(name)
-        if state is None:
-            state = self._new_state(name, module.weight.detach())
-            self.states[name] = state
-        rotated_blocks = self._block_grid(state, self._rotated_blocks(state, module.weight.detach()).float())
-        metrics = self._block_metrics_from_hessian(state, hessian, device=rotated_blocks.device)
-        metric_diag = metrics.diagonal(dim1=-2, dim2=-1)
-        initial_scales = rotated_blocks.norm(dim=-1, keepdim=True).clamp_min(1e-8)
-        normalized_blocks = rotated_blocks / initial_scales
-        fixed_flat, fixed_idx_flat = _quantize_e8p_blocks(
-            self._flatten_blocks(normalized_blocks),
-            self.h.codebook_lattice_scale,
-        )
-        fixed_blocks = self._block_grid(state, fixed_flat)
-        state["fixed_idx"].copy_(fixed_idx_flat.to(device=state["fixed_idx"].device))
-        state["log_scales"].copy_(
-            initial_scales.reshape(-1, 1).log().to(device=state["log_scales"].device, dtype=state["log_scales"].dtype)
-        )
-        residual_seed = normalized_blocks - fixed_blocks
-        self._initialize_residual_codebook(state, residual_seed, metrics)
-
-        for _ in range(max(self.h.codebook_refinement_iters, 1)):
-            residual_codebook = state["residual_codebook"].to(device=rotated_blocks.device, dtype=torch.float32)
-            fixed_idx, fixed_blocks, residual_idx, residual_vals, scales = self._local_assign_blocks(
-                state,
-                rotated_blocks,
-                metrics,
-                residual_codebook,
-                initial_scales,
-            )
-            residual_targets = rotated_blocks / scales - fixed_blocks
-            updated_codebook = self._weighted_codebook_update(
-                residual_targets,
-                residual_idx,
-                metrics,
-                residual_codebook,
-            )
-            state["residual_codebook"].copy_(
-                updated_codebook.to(device=state["residual_codebook"].device, dtype=state["residual_codebook"].dtype)
-            )
-            initial_scales = scales
-
-        residual_codebook = state["residual_codebook"].to(device=rotated_blocks.device, dtype=torch.float32)
-        fixed_idx, fixed_blocks, residual_idx, residual_vals, scales = self._local_assign_blocks(
-            state,
-            rotated_blocks,
-            metrics,
-            residual_codebook,
-            initial_scales,
-        )
-        state["fixed_idx"].copy_(fixed_idx.reshape(-1).to(device=state["fixed_idx"].device))
-        state["residual_idx"].copy_(residual_idx.reshape(-1).to(device=state["residual_idx"].device))
-        state["log_scales"].copy_(
-            scales.reshape(-1, 1).log().to(device=state["log_scales"].device, dtype=state["log_scales"].dtype)
-        )
-        residual_rotated = (fixed_blocks + residual_vals) * scales
-        self._select_outliers(state, rotated_blocks, residual_rotated, metrics)
-
-        stats = self._snapshot_stats(state, module.weight.detach())
-        stats.update(
-            {
-                "metric_diag_min": float(metric_diag.min().item()),
-                "metric_diag_mean": float(metric_diag.mean().item()),
-                "metric_diag_max": float(metric_diag.max().item()),
-                "hessian_missing": float(hessian is None),
-            }
-        )
-        state["stats"] = stats
-        return name, stats
-
-    @torch.no_grad()
-    def fit(self, model: nn.Module, hessians: dict[str, Tensor]) -> None:
         if not self.target_modules:
             if self.h.is_main_process:
                 log("codebook:no eligible tensors found")
             return
-        target_weights = sum(int(module.weight.numel()) for _, module in self.target_modules)
-        total_fp_weights = sum(
-            int(t.numel())
-            for _, t in model.state_dict().items()
-            if t.is_floating_point()
+        should_log_groups = (
+            force
+            or not self.active
+            or self.h.codebook_debug_every <= 0
+            or step % self.h.codebook_debug_every == 0
         )
-        coverage = target_weights / max(total_fp_weights, 1)
+        if not self.active and self.h.is_main_process:
+            target_weights = sum(int(module.weight.numel()) for _, module in self.target_modules)
+            total_fp_weights = sum(int(t.numel()) for t in model.state_dict().values() if t.is_floating_point())
+            coverage = target_weights / max(total_fp_weights, 1)
+            log(
+                f"codebook:activate step:{step} frac:{frac:.4f} target_tensors:{len(self.target_modules)} "
+                f"target_weights:{target_weights} coverage:{coverage:.4%}"
+            )
+        refreshed_states = [self._refresh_tensor(name, module) for name, module in self.target_modules]
+        self.states = {state.name: state for state in refreshed_states}
+        self.active = True
+        self.last_refresh_step = step
+        self.num_refreshes += 1
+        if self.h.codebook_qat_enabled and frac >= self.h.codebook_qat_start_frac:
+            if not self.qat_active and self.h.is_main_process:
+                log(f"codebook:qat_enabled step:{step} frac:{frac:.4f}")
+            self.qat_active = True
+            for _, module in self.target_modules:
+                assert module.codebook_qat is not None
+                module.codebook_qat.set_active(True)
+
+        total_target_weights = sum(int(state.stats["num_weights"]) for state in refreshed_states)
+        weighted_rel_mse = sum(float(state.stats["rel_mse"]) * int(state.stats["num_weights"]) for state in refreshed_states)
+        total_raw_bits = sum(int(state.stats["raw_bits"]) for state in refreshed_states)
         if self.h.is_main_process:
             log(
-                f"codebook:fit target_tensors:{len(self.target_modules)} target_weights:{target_weights} "
-                f"coverage:{coverage:.4%} calibration_batches:{self.h.codebook_calibration_batches} "
-                f"hadamard_backend:{HADAMARD_BACKEND} lattice:e8p12"
+                f"codebook:refresh step:{step} frac:{frac:.4f} refreshes:{self.num_refreshes} "
+                f"target_rel_mse:{weighted_rel_mse / max(total_target_weights, 1):.6e} "
+                f"target_raw_bpw:{total_raw_bits / max(total_target_weights, 1):.4f}"
             )
-        missing = [name for name, _ in self.target_modules if name not in hessians]
-        if missing and self.h.is_main_process:
-            log(f"codebook:missing_hessians count:{len(missing)} fallback:identity_block_metric")
-        fitted_items = [self._fit_tensor(name, module, hessians.get(name)) for name, module in self.target_modules]
-        total_target_weights = sum(int(stats["num_weights"]) for _, stats in fitted_items)
-        weighted_fixed_rel_mse = sum(float(stats["fixed_rel_mse"]) * int(stats["num_weights"]) for _, stats in fitted_items)
-        weighted_residual_rel_mse = sum(float(stats["residual_rel_mse"]) * int(stats["num_weights"]) for _, stats in fitted_items)
-        weighted_rel_mse = sum(float(stats["rel_mse"]) * int(stats["num_weights"]) for _, stats in fitted_items)
-        total_raw_bits = sum(int(stats["raw_bits"]) for _, stats in fitted_items)
-        total_fixed_raw_bits = sum(int(stats["fixed_raw_bits"]) for _, stats in fitted_items)
-        total_residual_raw_bits = sum(int(stats["residual_raw_bits"]) for _, stats in fitted_items)
-        total_outlier_raw_bits = sum(int(stats["outlier_raw_bits"]) for _, stats in fitted_items)
-        total_outlier_blocks = sum(int(stats["outlier_blocks"]) for _, stats in fitted_items)
-        total_blocks = sum(int(stats["num_blocks"]) for _, stats in fitted_items)
-        if self.h.is_main_process:
-            log(
-                f"codebook:fit_summary fixed_rel_mse:{weighted_fixed_rel_mse / max(total_target_weights, 1):.6e} "
-                f"residual_rel_mse:{weighted_residual_rel_mse / max(total_target_weights, 1):.6e} "
-                f"final_rel_mse:{weighted_rel_mse / max(total_target_weights, 1):.6e} "
-                f"target_raw_bpw:{total_raw_bits / max(total_target_weights, 1):.4f} "
-                f"fixed_raw_bpw:{total_fixed_raw_bits / max(total_target_weights, 1):.4f} "
-                f"residual_raw_bpw:{total_residual_raw_bits / max(total_target_weights, 1):.4f} "
-                f"outlier_raw_bpw:{total_outlier_raw_bits / max(total_target_weights, 1):.4f} "
-                f"outlier_frac:{total_outlier_blocks / max(total_blocks, 1):.4%}"
+        if should_log_groups and self.h.is_main_process:
+            self._log_group_stats(
+                "codebook:refresh_groups",
+                [(state.name, state.stats) for state in refreshed_states],
             )
-            self._log_group_stats("codebook:fit_groups", fitted_items)
-            self._log_top_tensor_stats("codebook:fit_top", fitted_items, sort_key="rel_mse")
+
+    @torch.no_grad()
+    def refresh_for_export(self, model: nn.Module) -> None:
+        final_step = self.last_refresh_step if self.last_refresh_step is not None else 0
+        self.maybe_refresh(model, final_step, 1.0, force=True)
 
     def build_export(
         self,
@@ -1961,61 +1468,41 @@ class Codebook:
         total_raw_bits = 0
         total_target_weights = 0
         total_payload_bytes = 0
-        fixed_payload_bytes = 0
-        residual_payload_bytes = 0
-        outlier_payload_bytes = 0
+        codebook_payload_bytes = 0
         int8_fallback_payload_bytes = 0
         int8_fallback_weights = 0
         passthrough_payload_bytes = 0
         passthrough_weights = 0
-        total_fp_weights = sum(
-            int(t.numel())
-            for _, t in state_dict.items()
-            if t.is_floating_point()
-        )
+        total_fp_weights = sum(int(t.numel()) for t in state_dict.values() if t.is_floating_point())
         for name, tensor in state_dict.items():
+            if ".codebook_qat." in name:
+                continue
             t = tensor.detach()
             if name in self.states:
                 state = self.states[name]
-                fixed_idx_cpu = state["fixed_idx"].long().cpu()
-                residual_idx_cpu = state["residual_idx"].long().cpu()
-                residual_codebook_cpu = state["residual_codebook"].to(torch.float16).cpu().contiguous()
-                scales_cpu = self._scales(state, device=torch.device("cpu"), dtype=torch.float32)
-                scale_codes, scale_meta = quantize_log_scales(scales_cpu, self.h.codebook_scale_bits)
-                packed_fixed_idx = _pack_codes(fixed_idx_cpu, 16).cpu().contiguous()
-                packed_residual_idx = _pack_codes(
-                    residual_idx_cpu,
-                    _bits_for_size(self.h.codebook_residual_k),
-                ).cpu().contiguous()
+                idx1_bits = _bits_for_size(self.h.codebook_k1)
+                idx2_bits = _bits_for_size(self.h.codebook_k2)
+                scale_codes, scale_meta = quantize_log_scales(state.scales, self.h.codebook_scale_bits)
+                packed_idx1 = _pack_codes(state.idx1.long(), idx1_bits).cpu().contiguous()
+                packed_idx2 = _pack_codes(state.idx2.long(), idx2_bits).cpu().contiguous()
                 packed_scales = _pack_codes(scale_codes, self.h.codebook_scale_bits).cpu().contiguous()
-                result[name + ".fi"] = packed_fixed_idx
-                result[name + ".rc"] = residual_codebook_cpu
-                result[name + ".ri"] = packed_residual_idx
+                result[name + ".c1"] = state.codebook1.to(torch.float16).cpu().contiguous()
+                result[name + ".c2"] = state.codebook2.to(torch.float16).cpu().contiguous()
+                result[name + ".i1"] = packed_idx1
+                result[name + ".i2"] = packed_idx2
                 result[name + ".s"] = packed_scales
-
-                outlier_count = int(state["outlier_positions"].numel())
-                outlier_position_bits = _bits_for_size(int(state["fixed_idx"].numel()))
-                if outlier_count > 0:
-                    result[name + ".op"] = _pack_codes(state["outlier_positions"].long().cpu(), outlier_position_bits).cpu().contiguous()
-                    result[name + ".oq"] = state["outlier_q"].cpu().contiguous()
-                    result[name + ".os"] = state["outlier_scale"].cpu().contiguous()
-
                 meta[name] = {
-                    "type": "codebook_hybrid",
-                    "shape": list(state["shape"]),
-                    "block_dim": int(state["block_dim"]),
-                    "fixed_bits": 16,
-                    "fixed_codebook": "E8P12",
-                    "lattice_scale": float(self.h.codebook_lattice_scale),
-                    "residual_k": self.h.codebook_residual_k,
-                    "residual_bits": _bits_for_size(self.h.codebook_residual_k),
+                    "type": "codebook_hadamard",
+                    "shape": list(state.shape),
+                    "block_dim": state.block_dim,
+                    "k1": self.h.codebook_k1,
+                    "k2": self.h.codebook_k2,
+                    "idx1_bits": idx1_bits,
+                    "idx2_bits": idx2_bits,
                     "scale_bits": self.h.codebook_scale_bits,
                     "scale_log_min": scale_meta["log_min"],
                     "scale_log_max": scale_meta["log_max"],
-                    "outlier_count": outlier_count,
-                    "outlier_position_bits": outlier_position_bits,
                 }
-
                 quantized_scales = dequantize_log_scales(
                     scale_codes,
                     self.h.codebook_scale_bits,
@@ -2024,72 +1511,29 @@ class Codebook:
                     device=torch.device("cpu"),
                     dtype=torch.float32,
                 )
-                fixed_blocks_cpu = _decode_e8p_blocks(
-                    fixed_idx_cpu,
-                    self.h.codebook_lattice_scale,
-                    device=torch.device("cpu"),
-                    dtype=torch.float32,
+                rotated_recon = _reconstruct_rotated_blocks_from_state(state)
+                idx1 = state.idx1.long()
+                idx2 = state.idx2.long()
+                normalized_recon = codebook_lookup(idx1, state.codebook1.float()) + codebook_lookup(idx2, state.codebook2.float())
+                export_diff = rotated_recon - normalized_recon * quantized_scales
+                export_mse = float(export_diff.square().mean().item())
+                export_rel_mse = export_mse / max(float(rotated_recon.square().mean().item()), 1e-12)
+                payload_bytes = sum(
+                    result[key].numel() * result[key].element_size()
+                    for key in (name + ".c1", name + ".c2", name + ".i1", name + ".i2", name + ".s")
                 )
-                residual_blocks_cpu = codebook_lookup(residual_idx_cpu, residual_codebook_cpu.float())
-                fixed_rotated = fixed_blocks_cpu * quantized_scales
-                residual_rotated = (fixed_blocks_cpu + residual_blocks_cpu) * quantized_scales
-                final_rotated = residual_rotated.clone()
-                if outlier_count > 0:
-                    outlier_delta = dequantize_int8_rows(
-                        result[name + ".oq"],
-                        result[name + ".os"],
-                        device=torch.device("cpu"),
-                        dtype=torch.float32,
-                    )
-                    final_rotated.index_add_(0, state["outlier_positions"].long().cpu(), outlier_delta)
-                target_rotated = self._rotated_blocks(state, t).float().cpu()
-                fixed_diff = target_rotated - fixed_rotated
-                residual_diff = target_rotated - residual_rotated
-                final_diff = target_rotated - final_rotated
-                fixed_mse = float(fixed_diff.square().mean().item())
-                residual_mse = float(residual_diff.square().mean().item())
-                final_mse = float(final_diff.square().mean().item())
-                final_rel_mse = final_mse / max(float(target_rotated.square().mean().item()), 1e-12)
-
-                payload_keys = [name + ".fi", name + ".rc", name + ".ri", name + ".s"]
-                if outlier_count > 0:
-                    payload_keys.extend([name + ".op", name + ".oq", name + ".os"])
-                payload_bytes = sum(result[key].numel() * result[key].element_size() for key in payload_keys)
-                fixed_bytes = result[name + ".fi"].numel() * result[name + ".fi"].element_size()
-                residual_bytes = (
-                    result[name + ".rc"].numel() * result[name + ".rc"].element_size()
-                    + result[name + ".ri"].numel() * result[name + ".ri"].element_size()
-                    + result[name + ".s"].numel() * result[name + ".s"].element_size()
-                )
-                outlier_bytes = 0
-                if outlier_count > 0:
-                    outlier_bytes = sum(result[key].numel() * result[key].element_size() for key in (name + ".op", name + ".oq", name + ".os"))
                 total_payload_bytes += payload_bytes
-                fixed_payload_bytes += fixed_bytes
-                residual_payload_bytes += residual_bytes
-                outlier_payload_bytes += outlier_bytes
-                state_export_stats = dict(state["stats"])
-                state_export_stats.update(
-                    {
-                        "fixed_mse": fixed_mse,
-                        "fixed_rmse": math.sqrt(fixed_mse),
-                        "residual_mse": residual_mse,
-                        "residual_rmse": math.sqrt(residual_mse),
-                        "mse": final_mse,
-                        "rmse": math.sqrt(final_mse),
-                        "rel_mse": final_rel_mse,
-                        "payload_bytes": payload_bytes,
-                        "fixed_payload_bytes": fixed_bytes,
-                        "residual_payload_bytes": residual_bytes,
-                        "outlier_payload_bytes": outlier_bytes,
-                        "raw_bpw": float(self._state_raw_bits(state)) / max(float(state["fixed_idx"].numel() * int(state["block_dim"])), 1.0),
-                        "scale_log_min": scale_meta["log_min"],
-                        "scale_log_max": scale_meta["log_max"],
-                    }
-                )
-                total_raw_bits += int(state_export_stats["raw_bits"])
-                total_target_weights += int(state_export_stats["num_weights"])
-                export_stats["tensors"][name] = state_export_stats
+                codebook_payload_bytes += payload_bytes
+                total_raw_bits += int(state.stats["raw_bits"])
+                total_target_weights += int(state.stats["num_weights"])
+                export_stats["tensors"][name] = {
+                    **state.stats,
+                    "payload_bytes": payload_bytes,
+                    "raw_bpw": float(state.stats["raw_bits"]) / max(float(state.stats["num_weights"]), 1.0),
+                    "scale_log_min": scale_meta["log_min"],
+                    "scale_log_max": scale_meta["log_max"],
+                    "export_rel_mse": export_rel_mse,
+                }
                 continue
             if not t.is_floating_point() or t.numel() <= 65536:
                 result[name] = t.to(torch.float16).cpu().contiguous() if t.is_floating_point() else t.cpu().contiguous()
@@ -2129,9 +1573,7 @@ class Codebook:
             "target_raw_bpw": total_raw_bits / max(total_target_weights, 1),
             "model_fp_weights": total_fp_weights,
             "coverage": total_target_weights / max(total_fp_weights, 1),
-            "fixed_payload_bytes": fixed_payload_bytes,
-            "residual_payload_bytes": residual_payload_bytes,
-            "outlier_payload_bytes": outlier_payload_bytes,
+            "codebook_payload_bytes": codebook_payload_bytes,
             "int8_fallback_payload_bytes": int8_fallback_payload_bytes,
             "int8_fallback_weights": int8_fallback_weights,
             "passthrough_weights": passthrough_weights,
@@ -2148,7 +1590,7 @@ class Codebook:
 def quantize_state_dict_codebook(
     state_dict: dict[str, Tensor],
     h: Hyperparameters,
-    quantizer: Codebook,
+    quantizer: OnlineCodebookQuantizer,
 ) -> tuple[dict[str, Tensor], dict[str, object], dict[str, object]]:
     _validate_codebook_hparams(h)
     return quantizer.build_export(state_dict)
@@ -2180,44 +1622,25 @@ def dequantize_state_dict_codebook(
             else:
                 out[name] = (q.float() * float(s.item())).to(orig.dtype)
             continue
-        if info.get("type") != "codebook_hybrid":
-            raise ValueError(f"Unsupported compression metadata for {name}: {info!r}")
         shape = tuple(int(x) for x in info["shape"])
         block_dim = int(info["block_dim"])
         num_blocks = math.prod(shape) // block_dim
-        fixed_idx = _unpack_codes(result[name + ".fi"], int(info["fixed_bits"]), num_blocks)
-        residual_codebook = result[name + ".rc"].to(dtype=torch.float32)
-        residual_idx = _unpack_codes(result[name + ".ri"], int(info["residual_bits"]), num_blocks)
+        codebook1 = result[name + ".c1"].to(device=orig.device, dtype=torch.float32)
+        codebook2 = result[name + ".c2"].to(device=orig.device, dtype=torch.float32)
+        idx1 = _unpack_codes(result[name + ".i1"], int(info["idx1_bits"]), num_blocks).to(device=orig.device)
+        idx2 = _unpack_codes(result[name + ".i2"], int(info["idx2_bits"]), num_blocks).to(device=orig.device)
         scale_codes = _unpack_codes(result[name + ".s"], int(info["scale_bits"]), num_blocks)
         scales = dequantize_log_scales(
             scale_codes,
             int(info["scale_bits"]),
             float(info["scale_log_min"]),
             float(info["scale_log_max"]),
-            device=torch.device("cpu"),
+            device=orig.device,
             dtype=torch.float32,
         )
-        fixed_blocks = _decode_e8p_blocks(
-            fixed_idx,
-            float(info["lattice_scale"]),
-            device=torch.device("cpu"),
-            dtype=torch.float32,
-        )
-        residual_blocks = codebook_lookup(residual_idx, residual_codebook)
-        rotated_blocks = (fixed_blocks + residual_blocks) * scales
-        outlier_count = int(info.get("outlier_count", 0))
-        if outlier_count > 0:
-            positions = _unpack_codes(result[name + ".op"], int(info["outlier_position_bits"]), outlier_count)
-            delta = dequantize_int8_rows(
-                result[name + ".oq"],
-                result[name + ".os"],
-                device=torch.device("cpu"),
-                dtype=torch.float32,
-            )
-            rotated_blocks.index_add_(0, positions.long(), delta)
-        sign_vec = _hadamard_sign_vector(name, block_dim, device=torch.device("cpu"), dtype=rotated_blocks.dtype)
-        blocks = hadamard_unrotate_blocks(rotated_blocks, sign_vec)
-        out[name] = _unblockify_weight(blocks, shape).to(orig.dtype)
+        rotated_blocks = (codebook_lookup(idx1, codebook1) + codebook_lookup(idx2, codebook2)) * scales
+        sign_vec = _hadamard_sign_vector(name, block_dim, device=orig.device, dtype=rotated_blocks.dtype)
+        out[name] = _unblockify_weight(hadamard_unrotate_blocks(rotated_blocks, sign_vec), shape).to(orig.dtype)
     return out
 
 
@@ -2284,9 +1707,8 @@ def serialize(
     h: Hyperparameters,
     base_model: torch.nn.Module,
     code: str,
+    quantizer: OnlineCodebookQuantizer,
 ) -> int:
-    quantizer = Codebook(h, base_model)
-    device = next(base_model.parameters()).device
     model_bytes = None
     code_bytes = len(code.encode("utf-8"))
     bytes_total = code_bytes
@@ -2295,26 +1717,7 @@ def serialize(
         model_bytes = os.path.getsize(h.model_path)
         log(f"Serialized model: {model_bytes} bytes")
         log(f"Code size: {code_bytes} bytes")
-    hessians: dict[str, Tensor] = {}
-    if quantizer.target_names:
-        if h.is_main_process:
-            log("codebook:collecting calibration hessians...")
-        t0 = time.perf_counter()
-        calib_loader = DistributedTokenLoader(h.train_files, h.rank, h.world_size, device)
-        hessians = collect_hessians(
-            base_model,
-            calib_loader,
-            h,
-            device,
-            quantizer.target_names,
-            h.codebook_calibration_batches,
-        )
-        if h.is_main_process:
-            log(f"codebook:collected {len(hessians)} hessians in {time.perf_counter() - t0:.1f}s")
-    if h.is_main_process:
-        t0 = time.perf_counter()
-        quantizer.fit(base_model, hessians)
-        log(f"codebook:fit_time:{time.perf_counter() - t0:.1f}s")
+        quantizer.refresh_for_export(base_model)
         quant_result, quant_meta, quant_stats = quantize_state_dict_codebook(base_model.state_dict(), h, quantizer)
         quant_buf = io.BytesIO()
         torch.save({"w": quant_result, "m": quant_meta, "s": quant_stats}, quant_buf)
@@ -2334,9 +1737,7 @@ def serialize(
             f"target_raw_bpw:{summary.get('target_raw_bpw', 0.0):.4f}"
         )
         log(
-            f"Codebook payload breakdown fixed_bytes:{summary.get('fixed_payload_bytes', 0)} "
-            f"residual_bytes:{summary.get('residual_payload_bytes', 0)} "
-            f"outlier_bytes:{summary.get('outlier_payload_bytes', 0)} "
+            f"Codebook payload breakdown codebook_bytes:{summary.get('codebook_payload_bytes', 0)} "
             f"int8_fallback_bytes:{summary.get('int8_fallback_payload_bytes', 0)} "
             f"int8_fallback_weights:{summary.get('int8_fallback_weights', 0)} "
             f"passthrough_bytes:{summary.get('passthrough_payload_bytes', 0)} "
@@ -2351,25 +1752,11 @@ def serialize(
             if stats is None:
                 continue
             group_parts.append(
-                f"{group}_fixed_mse:{stats['fixed_mse']:.6e} {group}_fixed_rmse:{stats['fixed_rmse']:.6e} "
-                f"{group}_residual_mse:{stats['residual_mse']:.6e} {group}_residual_rmse:{stats['residual_rmse']:.6e} "
-                f"{group}_final_mse:{stats['mse']:.6e} {group}_final_rmse:{stats['rmse']:.6e} "
-                f"{group}_outlier_frac:{stats['outlier_frac']:.4%} "
-                f"{group}_used_residual_frac:{stats['used_residual_frac']:.2%} "
+                f"{group}_mse:{stats['mse']:.6e} {group}_rmse:{stats['rmse']:.6e} "
                 f"{group}_tensors:{int(stats['num_tensors'])}"
             )
         if len(group_parts) > 1:
             log(" ".join(group_parts))
-        quantizer._log_top_tensor_stats(
-            "codebook:export_top_error",
-            list(quant_stats.get("tensors", {}).items()),
-            sort_key="rel_mse",
-        )
-        quantizer._log_top_tensor_stats(
-            "codebook:export_top_payload",
-            list(quant_stats.get("tensors", {}).items()),
-            sort_key="payload_bytes",
-        )
         log(f"Total submission size codebook+{h.compressor}: {bytes_total} bytes")
     return bytes_total
 
@@ -2555,10 +1942,11 @@ def train_model(
     h: Hyperparameters,
     device: torch.device,
     val_data: ValidationData,
-) -> tuple[GPT, nn.Module]:
+) -> tuple[GPT, nn.Module, OnlineCodebookQuantizer]:
     # Set up model
     base_model = GPT(h).to(device).bfloat16()
     restore_fp32_params(base_model)
+    codebook_quantizer = OnlineCodebookQuantizer(h, base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     if h.distributed:
         model = DDP(compiled_model, device_ids=[h.local_rank], broadcast_buffers=False)
@@ -2572,9 +1960,6 @@ def train_model(
 
     # Helper functions for training
     max_wallclock_ms = 1000.0 * h.max_wallclock_seconds if h.max_wallclock_seconds > 0 else None
-    if max_wallclock_ms is not None and h.codebook_reserve_seconds > 0:
-        max_wallclock_ms = max(max_wallclock_ms - h.codebook_reserve_seconds * 1000.0, 0.0)
-        log(f"codebook:reserving {h.codebook_reserve_seconds:.0f}s, effective={max_wallclock_ms:.0f}ms")
 
     def training_frac(step: int, elapsed_ms: float) -> float:
         """Fraction of training completed (0 to 1), using step or wallclock."""
@@ -2602,8 +1987,8 @@ def train_model(
             (loss / h.grad_accum_steps).backward()
         train_loss /= h.grad_accum_steps
 
-        muon_frac = min(step / h.muon_momentum_warmup_steps, 1.0) if h.muon_momentum_warmup_steps > 0 else 1.0
-        muon_momentum = (1 - muon_frac) * h.muon_momentum_warmup_start + muon_frac * h.muon_momentum
+        frac = min(step / h.muon_momentum_warmup_steps, 1.0) if h.muon_momentum_warmup_steps > 0 else 1.0
+        muon_momentum = (1 - frac) * h.muon_momentum_warmup_start + frac * h.muon_momentum
         for group in optimizers.optimizer_muon.param_groups:
             group["momentum"] = muon_momentum
 
@@ -2665,6 +2050,7 @@ def train_model(
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         frac = training_frac(step, elapsed_ms)
         scale = lr_mul(frac)
+        codebook_quantizer.maybe_refresh(base_model, step, frac)
         train_loss = step_fn(step, scale)
 
         step += 1
@@ -2693,7 +2079,7 @@ def train_model(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    return base_model, compiled_model
+    return base_model, compiled_model, codebook_quantizer
 
 
 def train_and_eval(h: Hyperparameters, device: torch.device) -> None:
@@ -2706,10 +2092,10 @@ def train_and_eval(h: Hyperparameters, device: torch.device) -> None:
     log(f"train_shards: {len(list(Path(h.datasets_dir).resolve().glob('fineweb_train_*.bin')))}")
     log(f"val_tokens: {val_data.val_tokens.numel() - 1}")
 
-    base_model, compiled_model = train_model(h, device, val_data)
+    base_model, compiled_model, codebook_quantizer = train_model(h, device, val_data)
     timed_eval("pre-codebook export fp_model", eval_val, h, device, val_data, compiled_model)
 
-    serialize(h, base_model, Path(__file__).read_text(encoding="utf-8"))
+    serialize(h, base_model, Path(__file__).read_text(encoding="utf-8"), codebook_quantizer)
     if h.distributed:
         dist.barrier()
     eval_model = deserialize(h, device)
@@ -2759,6 +2145,7 @@ def main():
         log("=" * 100, console=False)
         log(f"Running Python {sys.version}", console=False)
         log(f"Running PyTorch {torch.__version__}", console=False)
+        log(f"Hadamard backend: {HADAMARD_BACKEND}", console=True)
         log(
             subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False).stdout,
             console=False,
