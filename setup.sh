@@ -5,6 +5,7 @@ source $HOME/.local/bin/env
 uv venv
 source .venv/bin/activate
 uv pip install -r requirements.txt 
+uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 git config --global user.name "Spruce Campbell" && git config --global user.email "spruce@mit.edu"
 git clone https://github.com/dao-ailab/flash-attention
 sudo apt update && sudo apt install git-lfs
