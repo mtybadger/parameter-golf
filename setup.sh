@@ -7,6 +7,7 @@ source .venv/bin/activate
 uv pip install -r requirements.txt 
 git config --global user.name "Spruce Campbell" && git config --global user.email "spruce@mit.edu"
 git clone https://github.com/dao-ailab/flash-attention
+sudo apt update && sudo apt install git-lfs
 cd flash-attention/hopper
 MAX_JOBS=64 \
 FLASH_ATTENTION_DISABLE_BACKWARD=FALSE \
@@ -27,3 +28,6 @@ FLASH_ATTENTION_DISABLE_HDIM192=TRUE \
 FLASH_ATTENTION_DISABLE_HDIM256=TRUE \
 FLASH_ATTENTION_DISABLE_SM80=FALSE \
 python setup.py install
+cd data
+git lfs pull -I "datasets/fineweb10B_sp4096/*"
+git lfs pull -I "tokenizers/fineweb_4096_bpe.model"
