@@ -1236,7 +1236,7 @@ def eval_val_sliding(
     return _loss_bpb(loss_sum, token_count, byte_count)
 
 
-def timed_eval(label: str, fn, *args, **kwargs) -> tuple[float, float]: d
+def timed_eval(label: str, fn, *args, **kwargs) -> tuple[float, float]: 
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     val_loss, val_bpb = fn(*args, **kwargs)
