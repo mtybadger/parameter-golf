@@ -20,34 +20,6 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch import Tensor, nn
 
 from flash_attn_interface import flash_attn_func as flash_attn_3_func
-from codebook.latticee8_padded12 import E8P12_codebook, decode_e8p_indices, quantize_blocks_to_e8p
-
-try:
-    from fast_hadamard_transform import hadamard_transform as _fast_hadamard_transform
-    HADAMARD_BACKEND = "fast_hadamard_transform"
-except Exception:
-    _fast_hadamard_transform = None
-    HADAMARD_BACKEND = "torch_fallback"
-
-
-def hadamard_transform(x: Tensor, scale: float = 1.0) -> Tensor:
-    if _fast_hadamard_transform is not None and x.is_cuda:
-        return _fast_hadamard_transform(x, scale=scale)
-    original_shape = x.shape
-    dim = x.shape[-1]
-    padded_dim = 1 << (max(dim, 1) - 1).bit_length()
-    out = x.reshape(-1, dim)
-    if padded_dim != dim:
-        out = F.pad(out, (0, padded_dim - dim))
-    h = 1
-    while h < padded_dim:
-        out = out.view(-1, padded_dim // (2 * h), 2, h)
-        a = out[:, :, 0, :]
-        b = out[:, :, 1, :]
-        out = torch.stack((a + b, a - b), dim=2).reshape(-1, padded_dim)
-        h *= 2
-    out = out[:, :dim]
-    return (out * scale).reshape(*original_shape)
 
 # ----------------------------------------
 # Hyperparameters
@@ -873,6 +845,235 @@ class Optimizers():
 # ----------------------------------------
 # Quantization
 # ----------------------------------------
+
+
+def hadamard_transform(x: Tensor, scale: float = 1.0) -> Tensor:
+    original_shape = x.shape
+    dim = x.shape[-1]
+    padded_dim = 1 << (max(dim, 1) - 1).bit_length()
+    out = x.reshape(-1, dim)
+    if padded_dim != dim:
+        out = F.pad(out, (0, padded_dim - dim))
+    h = 1
+    while h < padded_dim:
+        out = out.view(-1, padded_dim // (2 * h), 2, h)
+        a = out[:, :, 0, :]
+        b = out[:, :, 1, :]
+        out = torch.stack((a + b, a - b), dim=2).reshape(-1, padded_dim)
+        h *= 2
+    out = out[:, :dim]
+    return (out * scale).reshape(*original_shape)
+
+"""
+E8 2 bit, or E8P.
+
+D8^ = D8 + 1/2 intersected with ball of radius sqrt(10)
+|D8^| has 227 entries
+We then add 29 entries from the set of vectors with 5 3/2 and 3 1/2
+The total codebook is all 2^7 flips of these 256 entries (2^15) +- 1/4
+which makes 2^16 entries.
+This corresponds to a subset of E8 + 1/4
+"""
+
+_E8P_CODESZ = 8
+
+def get_norm12():
+    # 29 elements of norm 12 in E8 + 1/4
+    return torch.tensor([
+        [3, 1, 1, 1, 3, 3, 3, 3],
+        [1, 3, 1, 1, 3, 3, 3, 3],
+        [1, 1, 3, 1, 3, 3, 3, 3],
+        [1, 1, 1, 3, 3, 3, 3, 3],
+        [3, 3, 3, 1, 3, 3, 1, 1],
+        [3, 3, 3, 1, 3, 1, 3, 1],
+        [3, 3, 3, 1, 1, 3, 3, 1],
+        [3, 3, 3, 1, 3, 1, 1, 3],
+        [3, 3, 3, 1, 1, 3, 1, 3],
+        [3, 3, 3, 1, 1, 1, 3, 3],
+        [3, 3, 1, 3, 3, 3, 1, 1],
+        [3, 3, 1, 3, 3, 1, 3, 1],
+        [3, 3, 1, 3, 1, 3, 3, 1],
+        [3, 3, 1, 3, 3, 1, 1, 3],
+        [3, 3, 1, 3, 1, 3, 1, 3],
+        [3, 3, 1, 3, 1, 1, 3, 3],
+        [3, 1, 3, 3, 3, 3, 1, 1],
+        [3, 1, 3, 3, 3, 1, 3, 1],
+        [3, 1, 3, 3, 1, 3, 3, 1],
+        [3, 1, 3, 3, 3, 1, 1, 3],
+        [3, 1, 3, 3, 1, 3, 1, 3],
+        [1, 3, 3, 3, 1, 1, 3, 3],
+        [1, 3, 3, 3, 3, 3, 1, 1],
+        [1, 3, 3, 3, 3, 1, 3, 1],
+        [1, 3, 3, 3, 1, 3, 3, 1],
+        [1, 3, 3, 3, 3, 1, 1, 3],
+        [1, 3, 3, 3, 1, 3, 1, 3],
+        [1, 1, 3, 3, 1, 3, 3, 3],
+        [3, 3, 1, 1, 3, 3, 3, 1],
+    ]) / 2
+
+
+def get_packed_abs_grid():
+    intr = torch.arange(-4, 4)
+    d8 = torch.cartesian_prod(*[intr] * 8).float() + 1 / 2
+    d8m2 = (d8.sum(dim=-1) % 2 == 0)
+    d8n = d8.norm(dim=-1)**2 <= 10
+    d8abs = torch.unique(d8[sorted(torch.where(d8m2 * d8n)[0])].abs(), dim=0)
+    norm12 = get_norm12()
+    cba = torch.concat([d8abs, norm12], dim=0)
+    cba = cba[:, [0, 2, 4, 6, 1, 3, 5, 7]]
+    cba[:, 7] *= (1 - 2 * (cba.sum(1) % 2))
+    cba = cba * 2 + 8
+    cba = cba.to(torch.int32)
+    acc = cba[:, 0]
+    for i in range(7):
+        acc = acc | (cba[:, (i + 1)] << ((i + 1) * 4))
+    return acc
+
+
+def get_abs_grid():
+    intr = torch.arange(-4, 4)
+    d8 = torch.cartesian_prod(*[intr] * _E8P_CODESZ).float() + 1 / 2
+    d8m2 = (d8.sum(dim=-1) % 2 == 0)
+    d8n = d8.norm(dim=-1)**2 <= 10
+    d8abs = torch.unique(d8[sorted(torch.where(d8m2 * d8n)[0])].abs(), dim=0)
+    norm12 = get_norm12()
+    cba = torch.concat([d8abs, norm12], dim=0)
+    return cba
+
+
+def get_full_grid(packed_abs_grid):
+    synth_codebook = torch.zeros(1 << 16, 8)
+    parity_idx = []
+    shuffle_map = [0, 4, 1, 5, 2, 6, 3, 7]
+    for c in range(1 << 16):
+        signs = c & 255
+        abs = c >> 8
+        parity = 0
+        for i in range(8):
+            parity = parity ^ ((signs >> i) & 1)
+        signs = signs ^ parity
+        abs_code = packed_abs_grid[abs].item()
+        for i in range(8):
+            ii = shuffle_map[i]
+            synth_codebook[c, i] = (((abs_code >> (4 * ii)) & 15) - 8) * 0.5
+            if ((signs >> ii) & 1):
+                synth_codebook[c, i] *= -1
+        if parity:
+            synth_codebook[c, :] -= 0.25
+            parity_idx.append(c)
+        else:
+            synth_codebook[c, :] += 0.25
+    return synth_codebook, torch.arange(1 << 16), parity_idx
+
+
+_E8P_PACKED_ABS_CACHED = get_packed_abs_grid()
+_E8P_GRID, _E8P_GRID_IDX, _PARITY_IDX = get_full_grid(_E8P_PACKED_ABS_CACHED)
+
+
+class E8P12_codebook(nn.Module):
+
+    def __init__(self, inference=False):
+        super(E8P12_codebook, self).__init__()
+        self.opt_scale = 1.03
+        self.codesz = _E8P_CODESZ
+
+        if not inference:
+            self.register_buffer('grid', _E8P_GRID)
+            self.register_buffer('grid_norm', _E8P_GRID.norm(dim=-1)**2)
+            grid_part = _E8P_GRID[_PARITY_IDX] + 0.25
+            grid_part = grid_part[
+                torch.where(
+                    ((grid_part[:, :7] < 0).sum(dim=-1) <= 1) * \
+                    (grid_part[:, :7].min(dim=-1).values >= -0.5)
+                )[0]]
+            self.register_buffer('grid_part', grid_part)
+            self.register_buffer('grid_part_norm', grid_part.norm(dim=-1)**2)
+            abs_grid = get_abs_grid()
+            self.register_buffer('grid_abs_odd', abs_grid.sum(dim=-1) % 2 == 1)
+            self.register_buffer(
+                'part_abs_map',
+                self.round(grid_part.abs(), abs_grid,
+                           abs_grid.norm(dim=-1)**2)[1])
+            self.register_buffer('bit_map', 2**torch.arange(8))
+
+    def round(self, X, grid, grid_norm):
+        assert X.shape[-1] == self.codesz
+        Xqidx = (2 * X @ grid.T - grid_norm).argmax(-1)
+        return grid[Xqidx], Xqidx
+
+    def fast_quantize_part(self, X, parity):
+        X_part = torch.abs(X)
+        X_odd = torch.where((X < 0).sum(dim=-1) % 2 != 0)[0]
+        X_part[X_odd, 7] = -X_part[X_odd, 7]
+        mask = 1 - 2 * (X < 0).to(torch.float32)
+        mask[X_odd, 7] = -mask[X_odd, 7]
+        roundout, Xqidx = self.round(X_part, self.grid_part,
+                                     self.grid_part_norm)
+        vals = roundout * mask
+        err = (X - vals).norm(dim=-1)
+        abs_idx = self.part_abs_map[Xqidx]
+        sign_mask = (((roundout < 0) ^ (mask < 0))[:,
+                                                   [0, 2, 4, 6, 1, 3, 5, 7]])
+        sign_mask[:, 7] = sign_mask[:, 7] ^ self.grid_abs_odd[abs_idx]
+        sign_mask[:, 0] = sign_mask[:, 0] ^ parity
+        mask_idx = (sign_mask * self.bit_map).sum(dim=-1).int()
+        idx = (abs_idx << 8) + mask_idx
+        return vals, idx, err
+
+    def quantize(self, X, return_idx=True, **kwargs):
+        X_plus = X + 1 / 4  # quantize X to D8^ - 1/4
+        X_minus = X - 1 / 4  # quantize X to D8^ + 1/4
+
+        plus_vals, plus_idx, plus_err = self.fast_quantize_part(X_plus, True)
+        minus_vals, minus_idx, minus_err = self.fast_quantize_part(
+            X_minus, False)
+
+        which = plus_err < minus_err
+        final_vals = torch.where(which.unsqueeze(-1), plus_vals - 1 / 4,
+                                 minus_vals + 1 / 4)
+        final_idx = torch.where(which, plus_idx, minus_idx)
+
+        if return_idx:
+            return final_vals, final_idx
+
+        return final_vals
+
+    def decode(self, idxs: torch.Tensor) -> torch.Tensor:
+        grid = getattr(self, "grid", _E8P_GRID)
+        idxs_long = idxs.long().reshape(-1)
+        vals = grid.index_select(0, idxs_long)
+        return vals.view(*idxs.shape, self.codesz)
+
+
+@torch.no_grad()
+def quantize_blocks_to_e8p(
+    blocks: torch.Tensor,
+    *,
+    codebook: E8P12_codebook | None = None,
+    scale: float = 1.0,
+    return_idx: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor] | torch.Tensor:
+    local_codebook = codebook if codebook is not None else E8P12_codebook(inference=False)
+    scaled_blocks = blocks.to(dtype=torch.float32) * float(scale)
+    quantized = local_codebook.quantize(scaled_blocks, return_idx=return_idx)
+    if return_idx:
+        vals, idxs = quantized
+        return vals / float(scale), idxs
+    return quantized / float(scale)
+
+
+@torch.no_grad()
+def decode_e8p_indices(
+    idxs: torch.Tensor,
+    *,
+    codebook: E8P12_codebook | None = None,
+    scale: float = 1.0,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    local_codebook = codebook if codebook is not None else E8P12_codebook(inference=False)
+    decoded = local_codebook.decode(idxs)
+    return (decoded / float(scale)).to(dtype=dtype)
+
 
 def restore_fp32_params(model: nn.Module) -> None:
     """After .bfloat16(), restore CastedLinear weights and control params to FP32."""
@@ -1955,7 +2156,7 @@ class Codebook:
                 f"codebook:fit target_tensors:{len(self.target_modules)} target_weights:{target_weights} "
                 f"coverage:{coverage:.4%} calibration_batches:{self.h.codebook_calibration_batches} "
                 f"hadamard:{self.h.codebook_use_hadamard} residual:{self.h.codebook_use_residual} "
-                f"outliers:{self.h.codebook_use_outliers} hadamard_backend:{HADAMARD_BACKEND} lattice:e8p12"
+                f"outliers:{self.h.codebook_use_outliers} lattice:e8p12"
             )
         missing = [name for name, _ in self.target_modules if name not in hessians]
         if missing and self.h.is_main_process:
@@ -2005,6 +2206,9 @@ class Codebook:
         int8_fallback_weights = 0
         passthrough_payload_bytes = 0
         passthrough_weights = 0
+        residual_fallback_tensors = 0
+        residual_fallback_nonfinite = 0
+        residual_fallback_worse = 0
         total_fp_weights = sum(
             int(t.numel())
             for _, t in state_dict.items()
@@ -2021,42 +2225,6 @@ class Codebook:
                 scale_codes, scale_meta = quantize_log_scales(scales_cpu, self.h.codebook_scale_bits)
                 packed_fixed_idx = _pack_codes(fixed_idx_cpu, 16).cpu().contiguous()
                 packed_scales = _pack_codes(scale_codes, self.h.codebook_scale_bits).cpu().contiguous()
-                result[name + ".fi"] = packed_fixed_idx
-                result[name + ".s"] = packed_scales
-                if self.h.codebook_use_residual:
-                    packed_residual_idx = _pack_codes(
-                        residual_idx_cpu,
-                        _bits_for_size(self.h.codebook_residual_k),
-                    ).cpu().contiguous()
-                    result[name + ".rc"] = residual_codebook_cpu
-                    result[name + ".ri"] = packed_residual_idx
-
-                outlier_count = int(state["outlier_positions"].numel())
-                outlier_position_bits = _bits_for_size(int(state["fixed_idx"].numel()))
-                if outlier_count > 0:
-                    result[name + ".op"] = _pack_codes(state["outlier_positions"].long().cpu(), outlier_position_bits).cpu().contiguous()
-                    result[name + ".oq"] = state["outlier_q"].cpu().contiguous()
-                    result[name + ".os"] = state["outlier_scale"].cpu().contiguous()
-
-                meta[name] = {
-                    "type": "codebook_hybrid",
-                    "shape": list(state["shape"]),
-                    "block_dim": int(state["block_dim"]),
-                    "fixed_bits": 16,
-                    "fixed_codebook": "E8P12",
-                    "lattice_scale": float(self.h.codebook_lattice_scale),
-                    "hadamard": bool(self.h.codebook_use_hadamard),
-                    "residual_enabled": bool(self.h.codebook_use_residual),
-                    "residual_k": self.h.codebook_residual_k if self.h.codebook_use_residual else 0,
-                    "residual_bits": _bits_for_size(self.h.codebook_residual_k) if self.h.codebook_use_residual else 0,
-                    "scale_bits": self.h.codebook_scale_bits,
-                    "scale_log_min": scale_meta["log_min"],
-                    "scale_log_max": scale_meta["log_max"],
-                    "outlier_enabled": bool(self.h.codebook_use_outliers),
-                    "outlier_count": outlier_count,
-                    "outlier_position_bits": outlier_position_bits,
-                }
-
                 quantized_scales = dequantize_log_scales(
                     scale_codes,
                     self.h.codebook_scale_bits,
@@ -2071,47 +2239,126 @@ class Codebook:
                     device=torch.device("cpu"),
                     dtype=torch.float32,
                 )
-                if self.h.codebook_use_residual:
-                    residual_blocks_cpu = codebook_lookup(residual_idx_cpu, residual_codebook_cpu.float())
-                else:
-                    residual_blocks_cpu = torch.zeros_like(fixed_blocks_cpu)
+                target_rotated = self._rotated_blocks(state, t).float().cpu()
                 fixed_rotated = fixed_blocks_cpu * quantized_scales
-                residual_rotated = (fixed_blocks_cpu + residual_blocks_cpu) * quantized_scales
-                final_rotated = residual_rotated.clone()
-                if outlier_count > 0:
+                fixed_diff = target_rotated - fixed_rotated
+                fixed_mse = float(fixed_diff.square().mean().item())
+                target_energy = max(float(target_rotated.square().mean().item()), 1e-12)
+                fixed_rel_mse = fixed_mse / target_energy
+                use_residual_export = bool(self.h.codebook_use_residual)
+                residual_fallback_reason: str | None = None
+                residual_bits = _bits_for_size(self.h.codebook_residual_k) if self.h.codebook_use_residual else 0
+                residual_blocks_cpu = torch.zeros_like(fixed_blocks_cpu)
+                residual_rotated = fixed_rotated
+                residual_mse = fixed_mse
+                residual_rel_mse = fixed_rel_mse
+                if use_residual_export:
+                    residual_blocks_candidate = codebook_lookup(residual_idx_cpu, residual_codebook_cpu.float())
+                    residual_rotated_candidate = (fixed_blocks_cpu + residual_blocks_candidate) * quantized_scales
+                    residual_diff_candidate = target_rotated - residual_rotated_candidate
+                    residual_mse_candidate = float(residual_diff_candidate.square().mean().item())
+                    residual_rel_mse_candidate = residual_mse_candidate / target_energy
+                    residual_finite = bool(torch.isfinite(residual_rotated_candidate).all().item()) and math.isfinite(residual_mse_candidate)
+                    if residual_finite and residual_mse_candidate <= fixed_mse:
+                        residual_blocks_cpu = residual_blocks_candidate
+                        residual_rotated = residual_rotated_candidate
+                        residual_mse = residual_mse_candidate
+                        residual_rel_mse = residual_rel_mse_candidate
+                    else:
+                        use_residual_export = False
+                        residual_fallback_tensors += 1
+                        if residual_finite:
+                            residual_fallback_reason = "worse_than_fixed"
+                            residual_fallback_worse += 1
+                        else:
+                            residual_fallback_reason = "nonfinite"
+                            residual_fallback_nonfinite += 1
+                base_rotated = residual_rotated if use_residual_export else fixed_rotated
+                final_rotated = base_rotated.clone()
+                final_mse = residual_mse if use_residual_export else fixed_mse
+                final_rel_mse = residual_rel_mse if use_residual_export else fixed_rel_mse
+                outlier_positions_cpu = state["outlier_positions"].long().cpu()
+                outlier_count = int(outlier_positions_cpu.numel())
+                outlier_position_bits = _bits_for_size(int(state["fixed_idx"].numel()))
+                use_outliers_export = bool(self.h.codebook_use_outliers and outlier_count > 0)
+                if use_outliers_export:
+                    base_delta = target_rotated.index_select(0, outlier_positions_cpu) - base_rotated.index_select(0, outlier_positions_cpu)
+                    outlier_q_cpu, outlier_scale_cpu = quantize_float_tensor(base_delta)
+                    outlier_q_cpu = outlier_q_cpu.cpu().contiguous()
+                    outlier_scale_cpu = outlier_scale_cpu.view(-1).cpu().contiguous()
                     outlier_delta = dequantize_int8_rows(
-                        result[name + ".oq"],
-                        result[name + ".os"],
+                        outlier_q_cpu,
+                        outlier_scale_cpu,
                         device=torch.device("cpu"),
                         dtype=torch.float32,
                     )
-                    final_rotated.index_add_(0, state["outlier_positions"].long().cpu(), outlier_delta)
-                target_rotated = self._rotated_blocks(state, t).float().cpu()
-                fixed_diff = target_rotated - fixed_rotated
-                residual_diff = target_rotated - residual_rotated
-                final_diff = target_rotated - final_rotated
-                fixed_mse = float(fixed_diff.square().mean().item())
-                residual_mse = float(residual_diff.square().mean().item())
-                final_mse = float(final_diff.square().mean().item())
-                final_rel_mse = final_mse / max(float(target_rotated.square().mean().item()), 1e-12)
-
+                    final_rotated.index_add_(0, outlier_positions_cpu, outlier_delta)
+                    final_diff = target_rotated - final_rotated
+                    candidate_final_mse = float(final_diff.square().mean().item())
+                    candidate_final_rel_mse = candidate_final_mse / target_energy
+                    if math.isfinite(candidate_final_mse) and candidate_final_mse <= final_mse:
+                        final_mse = candidate_final_mse
+                        final_rel_mse = candidate_final_rel_mse
+                    else:
+                        use_outliers_export = False
+                        outlier_count = 0
+                        final_rotated = base_rotated
+                        final_mse = residual_mse if use_residual_export else fixed_mse
+                        final_rel_mse = residual_rel_mse if use_residual_export else fixed_rel_mse
+                result[name + ".fi"] = packed_fixed_idx
+                result[name + ".s"] = packed_scales
+                if use_residual_export:
+                    packed_residual_idx = _pack_codes(residual_idx_cpu, residual_bits).cpu().contiguous()
+                    result[name + ".rc"] = residual_codebook_cpu
+                    result[name + ".ri"] = packed_residual_idx
+                if use_outliers_export:
+                    result[name + ".op"] = _pack_codes(outlier_positions_cpu, outlier_position_bits).cpu().contiguous()
+                    result[name + ".oq"] = outlier_q_cpu
+                    result[name + ".os"] = outlier_scale_cpu
+                meta[name] = {
+                    "type": "codebook_hybrid",
+                    "shape": list(state["shape"]),
+                    "block_dim": int(state["block_dim"]),
+                    "fixed_bits": 16,
+                    "fixed_codebook": "E8P12",
+                    "lattice_scale": float(self.h.codebook_lattice_scale),
+                    "hadamard": bool(self.h.codebook_use_hadamard),
+                    "residual_enabled": use_residual_export,
+                    "residual_k": self.h.codebook_residual_k if use_residual_export else 0,
+                    "residual_bits": residual_bits if use_residual_export else 0,
+                    "residual_fallback_reason": residual_fallback_reason,
+                    "scale_bits": self.h.codebook_scale_bits,
+                    "scale_log_min": scale_meta["log_min"],
+                    "scale_log_max": scale_meta["log_max"],
+                    "outlier_enabled": use_outliers_export,
+                    "outlier_count": outlier_count,
+                    "outlier_position_bits": outlier_position_bits,
+                }
                 payload_keys = [name + ".fi", name + ".s"]
-                if self.h.codebook_use_residual:
+                if use_residual_export:
                     payload_keys.extend([name + ".rc", name + ".ri"])
-                if outlier_count > 0:
+                if use_outliers_export:
                     payload_keys.extend([name + ".op", name + ".oq", name + ".os"])
                 payload_bytes = sum(result[key].numel() * result[key].element_size() for key in payload_keys)
                 fixed_bytes = result[name + ".fi"].numel() * result[name + ".fi"].element_size()
                 scale_bytes = result[name + ".s"].numel() * result[name + ".s"].element_size()
                 residual_bytes = 0
-                if self.h.codebook_use_residual:
+                if use_residual_export:
                     residual_bytes = (
                         result[name + ".rc"].numel() * result[name + ".rc"].element_size()
                         + result[name + ".ri"].numel() * result[name + ".ri"].element_size()
                     )
                 outlier_bytes = 0
-                if outlier_count > 0:
+                if use_outliers_export:
                     outlier_bytes = sum(result[key].numel() * result[key].element_size() for key in (name + ".op", name + ".oq", name + ".os"))
+                num_blocks = int(state["fixed_idx"].numel())
+                fixed_raw_bits = _hybrid_fixed_raw_bits(num_blocks)
+                scale_raw_bits = _hybrid_scale_raw_bits(num_blocks, self.h)
+                residual_raw_bits = _hybrid_residual_raw_bits(num_blocks, self.h) if use_residual_export else 0
+                outlier_raw_bits = 0
+                if use_outliers_export and outlier_count > 0:
+                    outlier_raw_bits = outlier_count * (outlier_position_bits + int(state["block_dim"]) * 8 + 16)
+                raw_bits = int(fixed_raw_bits + scale_raw_bits + residual_raw_bits + outlier_raw_bits)
                 total_payload_bytes += payload_bytes
                 fixed_payload_bytes += fixed_bytes
                 scale_payload_bytes += scale_bytes
@@ -2124,6 +2371,8 @@ class Codebook:
                         "fixed_rmse": math.sqrt(fixed_mse),
                         "residual_mse": residual_mse,
                         "residual_rmse": math.sqrt(residual_mse),
+                        "fixed_rel_mse": fixed_rel_mse,
+                        "residual_rel_mse": residual_rel_mse,
                         "mse": final_mse,
                         "rmse": math.sqrt(final_mse),
                         "rel_mse": final_rel_mse,
@@ -2132,12 +2381,24 @@ class Codebook:
                         "scale_payload_bytes": scale_bytes,
                         "residual_payload_bytes": residual_bytes,
                         "outlier_payload_bytes": outlier_bytes,
-                        "raw_bpw": float(self._state_raw_bits(state)) / max(float(state["fixed_idx"].numel() * int(state["block_dim"])), 1.0),
+                        "raw_bits": raw_bits,
+                        "fixed_raw_bits": fixed_raw_bits,
+                        "fixed_raw_bpw": fixed_raw_bits / max(float(t.numel()), 1.0),
+                        "scale_raw_bits": scale_raw_bits,
+                        "scale_raw_bpw": scale_raw_bits / max(float(t.numel()), 1.0),
+                        "residual_raw_bits": residual_raw_bits,
+                        "residual_raw_bpw": residual_raw_bits / max(float(t.numel()), 1.0),
+                        "outlier_raw_bits": outlier_raw_bits,
+                        "outlier_raw_bpw": outlier_raw_bits / max(float(t.numel()), 1.0),
+                        "raw_bpw": raw_bits / max(float(t.numel()), 1.0),
+                        "used_residual": int(state["stats"].get("used_residual", 0)) if use_residual_export else 0,
+                        "outlier_blocks": outlier_count,
+                        "residual_fallback_reason": residual_fallback_reason,
                         "scale_log_min": scale_meta["log_min"],
                         "scale_log_max": scale_meta["log_max"],
                     }
                 )
-                total_raw_bits += int(state_export_stats["raw_bits"])
+                total_raw_bits += raw_bits
                 total_target_weights += int(state_export_stats["num_weights"])
                 export_stats["tensors"][name] = state_export_stats
                 continue
@@ -2189,6 +2450,9 @@ class Codebook:
             "passthrough_payload_bytes": passthrough_payload_bytes,
             "payload_bytes_before_torchsave": total_payload_bytes,
             "effective_payload_bpw_all_weights": (8.0 * total_payload_bytes) / max(total_fp_weights, 1),
+            "residual_fallback_tensors": residual_fallback_tensors,
+            "residual_fallback_nonfinite": residual_fallback_nonfinite,
+            "residual_fallback_worse": residual_fallback_worse,
         }
         export_stats["groups"] = self._aggregate_group_stats(
             [(name, stats) for name, stats in export_stats["tensors"].items()]
@@ -2419,6 +2683,12 @@ def serialize(
             )
         if len(group_parts) > 1:
             log(" ".join(group_parts))
+        if summary.get("residual_fallback_tensors", 0) > 0:
+            log(
+                f"codebook:export_residual_fallbacks tensors:{summary.get('residual_fallback_tensors', 0)} "
+                f"nonfinite:{summary.get('residual_fallback_nonfinite', 0)} "
+                f"worse_than_fixed:{summary.get('residual_fallback_worse', 0)}"
+            )
         quantizer._log_top_tensor_stats(
             "codebook:export_top_error",
             list(quant_stats.get("tensors", {}).items()),
