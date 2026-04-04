@@ -105,6 +105,10 @@ class Hyperparameters():
     codebook_lattice_scale = float(os.environ.get("CODEBOOK_LATTICE_SCALE", 1.03))
     codebook_ldlq_iters = int(os.environ.get("CODEBOOK_LDLQ_ITERS", 2))
     codebook_ldlq_topk = int(os.environ.get("CODEBOOK_LDLQ_TOPK", 4))
+    codebook_residual_max_norm = float(os.environ.get("CODEBOOK_RESIDUAL_MAX_NORM", 1.0))
+    codebook_residual_ridge = float(os.environ.get("CODEBOOK_RESIDUAL_RIDGE", 1e-3))
+    codebook_scale_q_lo = float(os.environ.get("CODEBOOK_SCALE_Q_LO", 0.005))
+    codebook_scale_q_hi = float(os.environ.get("CODEBOOK_SCALE_Q_HI", 0.995))
     codebook_outlier_frac = float(os.environ.get("CODEBOOK_OUTLIER_FRAC", 0.01))
     codebook_outlier_max_blocks = int(os.environ.get("CODEBOOK_OUTLIER_MAX_BLOCKS", 4096))
     codebook_debug_topk = int(os.environ.get("CODEBOOK_DEBUG_TOPK", 4))
@@ -1243,6 +1247,46 @@ def normalize_blocks(blocks: Tensor, eps: float = 1e-8) -> tuple[Tensor, Tensor]
     return blocks / scales, scales
 
 
+def clip_block_norms(blocks: Tensor, max_norm: float, eps: float = 1e-8) -> Tensor:
+    if max_norm <= 0.0:
+        return torch.zeros_like(blocks)
+    norms = blocks.norm(dim=-1, keepdim=True).clamp_min(eps)
+    return blocks * torch.clamp(max_norm / norms, max=1.0)
+
+
+def project_orthogonal(blocks: Tensor, base_dirs: Tensor) -> Tensor:
+    return blocks - (blocks * base_dirs).sum(dim=-1, keepdim=True) * base_dirs
+
+
+def compose_directional_blocks(
+    base_blocks: Tensor,
+    residual_blocks: Tensor,
+    max_norm: float,
+    eps: float = 1e-8,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    base_dirs, _ = normalize_blocks(base_blocks, eps=eps)
+    parallel = (residual_blocks * base_dirs).sum(dim=-1, keepdim=True)
+    tangent = clip_block_norms(
+        residual_blocks - parallel * base_dirs,
+        max_norm=max_norm,
+        eps=eps,
+    )
+    combined_dirs, _ = normalize_blocks(base_dirs + tangent, eps=eps)
+    return combined_dirs, base_dirs, tangent, parallel
+
+
+def directional_tangent_targets(
+    target_dirs: Tensor,
+    base_dirs: Tensor,
+    max_norm: float,
+    eps: float = 1e-8,
+) -> Tensor:
+    cos = (target_dirs * base_dirs).sum(dim=-1, keepdim=True).clamp_min(eps)
+    tangent = target_dirs / cos - base_dirs
+    tangent = project_orthogonal(tangent, base_dirs)
+    return clip_block_norms(tangent, max_norm=max_norm, eps=eps)
+
+
 def nearest_codeword(x: Tensor, codebook: Tensor) -> Tensor:
     dists = (
         x.square().sum(dim=-1, keepdim=True)
@@ -1283,20 +1327,52 @@ def _unpack_codes(packed: Tensor, bits: int, count: int) -> Tensor:
     return torch.from_numpy(codes_np.astype(np.int64, copy=False))
 
 
-def quantize_log_scales(scales: Tensor, bits: int, eps: float = 1e-8) -> tuple[Tensor, dict[str, float]]:
+def quantize_log_scales(
+    scales: Tensor,
+    bits: int,
+    *,
+    q_lo: float = 0.0,
+    q_hi: float = 1.0,
+    eps: float = 1e-8,
+) -> tuple[Tensor, dict[str, float]]:
     if not 1 <= bits <= 8:
         raise ValueError(f"Only 1..8 scale bits are supported, got {bits}")
+    if not 0.0 <= q_lo < q_hi <= 1.0:
+        raise ValueError(f"Scale quantiles must satisfy 0 <= q_lo < q_hi <= 1, got {q_lo}, {q_hi}")
     flat = scales.detach().view(-1).float().cpu().clamp_min(eps)
     log_scales = flat.log()
-    log_min = float(log_scales.min().item())
-    log_max = float(log_scales.max().item())
+    observed_log_min = float(log_scales.min().item())
+    observed_log_max = float(log_scales.max().item())
+    log_min = observed_log_min if q_lo <= 0.0 else float(torch.quantile(log_scales, q_lo).item())
+    log_max = observed_log_max if q_hi >= 1.0 else float(torch.quantile(log_scales, q_hi).item())
+    if log_max < log_min:
+        log_min, log_max = log_max, log_min
     levels = 1 << bits
     if levels <= 1 or log_max - log_min < 1e-12:
         codes = torch.zeros_like(flat, dtype=torch.long)
-        return codes, {"log_min": log_min, "log_max": log_min}
+        return codes, {
+            "log_min": log_min,
+            "log_max": log_min,
+            "observed_log_min": observed_log_min,
+            "observed_log_max": observed_log_max,
+            "quantile_lo": q_lo,
+            "quantile_hi": q_hi,
+            "clip_low_count": int((log_scales < log_min).sum().item()),
+            "clip_high_count": int((log_scales > log_min).sum().item()),
+        }
+    clipped_logs = log_scales.clamp(min=log_min, max=log_max)
     step = (log_max - log_min) / (levels - 1)
-    codes = torch.clamp(torch.round((log_scales - log_min) / step), 0, levels - 1).to(torch.long)
-    return codes, {"log_min": log_min, "log_max": log_max}
+    codes = torch.clamp(torch.round((clipped_logs - log_min) / step), 0, levels - 1).to(torch.long)
+    return codes, {
+        "log_min": log_min,
+        "log_max": log_max,
+        "observed_log_min": observed_log_min,
+        "observed_log_max": observed_log_max,
+        "quantile_lo": q_lo,
+        "quantile_hi": q_hi,
+        "clip_low_count": int((log_scales < log_min).sum().item()),
+        "clip_high_count": int((log_scales > log_max).sum().item()),
+    }
 
 
 def dequantize_log_scales(
@@ -1457,6 +1533,15 @@ def _validate_codebook_hparams(h: Hyperparameters) -> None:
         raise ValueError(f"CODEBOOK_LDLQ_ITERS must be positive, got {h.codebook_ldlq_iters}")
     if h.codebook_ldlq_topk <= 0:
         raise ValueError(f"CODEBOOK_LDLQ_TOPK must be positive, got {h.codebook_ldlq_topk}")
+    if h.codebook_residual_max_norm <= 0:
+        raise ValueError(f"CODEBOOK_RESIDUAL_MAX_NORM must be positive, got {h.codebook_residual_max_norm}")
+    if h.codebook_residual_ridge < 0:
+        raise ValueError(f"CODEBOOK_RESIDUAL_RIDGE must be non-negative, got {h.codebook_residual_ridge}")
+    if not 0.0 <= h.codebook_scale_q_lo < h.codebook_scale_q_hi <= 1.0:
+        raise ValueError(
+            "CODEBOOK_SCALE_Q_LO and CODEBOOK_SCALE_Q_HI must satisfy "
+            f"0 <= lo < hi <= 1, got lo={h.codebook_scale_q_lo}, hi={h.codebook_scale_q_hi}"
+        )
     if not 0.0 <= h.codebook_outlier_frac <= 1.0:
         raise ValueError(f"CODEBOOK_OUTLIER_FRAC must be in [0, 1], got {h.codebook_outlier_frac}")
     if h.codebook_outlier_max_blocks < 0:
@@ -1498,6 +1583,7 @@ class Codebook:
         self.states: dict[str, dict[str, object]] = {}
         self.target_modules: list[tuple[str, CastedLinear]] = []
         self.target_names: set[str] = set()
+        self.last_fit_summary: dict[str, float] = {}
         for module_name, module in model.named_modules():
             if not isinstance(module, CastedLinear):
                 continue
@@ -1510,6 +1596,26 @@ class Codebook:
 
     def _active_residual_k(self) -> int:
         return self.h.codebook_residual_k if self.h.codebook_use_residual else 0
+
+    def _residual_max_norm(self) -> float:
+        return self.h.codebook_residual_max_norm if self.h.codebook_use_residual else 0.0
+
+    def _stabilize_residual_codebook(self, codebook: Tensor) -> Tensor:
+        if codebook.numel() == 0:
+            return codebook
+        stabilized = torch.nan_to_num(codebook, nan=0.0, posinf=0.0, neginf=0.0)
+        return clip_block_norms(stabilized, max_norm=self._residual_max_norm())
+
+    @staticmethod
+    def _metric_assign_codewords(targets: Tensor, metrics: Tensor, codebook: Tensor) -> Tensor:
+        target_metric = torch.einsum("npd,pde->npe", targets, metrics)
+        codebook_metric = torch.einsum("kd,pde->pke", codebook, metrics)
+        dists = (
+            (target_metric * targets).sum(dim=-1, keepdim=True)
+            - 2.0 * torch.matmul(target_metric, codebook.t())
+            + (codebook_metric * codebook.unsqueeze(0)).sum(dim=-1).unsqueeze(0)
+        )
+        return dists.argmin(dim=-1)
 
     @staticmethod
     def _tensor_group(name: str) -> str | None:
@@ -1526,6 +1632,72 @@ class Codebook:
     ) -> tuple[float, float]:
         mse = bucket[key] / max(bucket["num_weights"], 1.0)
         return mse, math.sqrt(mse)
+
+    def _aggregate_invariant_summary(self, items: list[tuple[str, dict[str, object]]]) -> dict[str, float]:
+        weighted_keys = (
+            "scale_p01",
+            "scale_p50",
+            "scale_p99",
+            "residual_code_norm_p50",
+            "residual_code_norm_p95",
+            "residual_tangent_norm_p50",
+            "residual_tangent_norm_p95",
+            "residual_parallel_frac_mean",
+            "scale_clip_low_frac",
+            "scale_clip_high_frac",
+            "scale_code_floor_frac",
+            "scale_code_ceiling_frac",
+        )
+        max_keys = (
+            "residual_code_norm_max",
+            "residual_tangent_norm_max",
+        )
+        summary = {key: 0.0 for key in weighted_keys}
+        summary.update({key: 0.0 for key in max_keys})
+        summary["num_blocks"] = 0.0
+        summary["export_residual_fp16_saturations"] = 0.0
+        for _, stats in items:
+            num_blocks = float(stats.get("num_blocks", 0.0))
+            summary["num_blocks"] += num_blocks
+            for key in weighted_keys:
+                summary[key] += float(stats.get(key, 0.0)) * num_blocks
+            for key in max_keys:
+                summary[key] = max(summary[key], float(stats.get(key, 0.0)))
+            summary["export_residual_fp16_saturations"] += float(stats.get("export_residual_fp16_saturations", 0.0))
+        if summary["num_blocks"] > 0:
+            for key in weighted_keys:
+                summary[key] /= summary["num_blocks"]
+        return summary
+
+    def _log_invariant_stats(self, prefix: str, items: list[tuple[str, dict[str, object]]]) -> None:
+        if not items:
+            return
+        summary = self._aggregate_invariant_summary(items)
+        parts = [
+            prefix,
+            f"scale_p01:{summary['scale_p01']:.3e}",
+            f"scale_p50:{summary['scale_p50']:.3e}",
+            f"scale_p99:{summary['scale_p99']:.3e}",
+            f"residual_code_norm_p50:{summary['residual_code_norm_p50']:.3e}",
+            f"residual_code_norm_p95:{summary['residual_code_norm_p95']:.3e}",
+            f"residual_code_norm_max:{summary['residual_code_norm_max']:.3e}",
+            f"residual_tangent_p50:{summary['residual_tangent_norm_p50']:.3e}",
+            f"residual_tangent_p95:{summary['residual_tangent_norm_p95']:.3e}",
+            f"residual_tangent_max:{summary['residual_tangent_norm_max']:.3e}",
+            f"parallel_frac:{summary['residual_parallel_frac_mean']:.3e}",
+        ]
+        if summary["scale_clip_low_frac"] > 0.0 or summary["scale_clip_high_frac"] > 0.0:
+            parts.extend(
+                [
+                    f"scale_clip_low_frac:{summary['scale_clip_low_frac']:.3e}",
+                    f"scale_clip_high_frac:{summary['scale_clip_high_frac']:.3e}",
+                    f"scale_code_floor_frac:{summary['scale_code_floor_frac']:.3e}",
+                    f"scale_code_ceiling_frac:{summary['scale_code_ceiling_frac']:.3e}",
+                ]
+            )
+        if summary["export_residual_fp16_saturations"] > 0.0:
+            parts.append(f"residual_fp16_saturations:{int(summary['export_residual_fp16_saturations'])}")
+        log(" ".join(parts))
 
     def _aggregate_group_stats(self, items: list[tuple[str, dict[str, object]]]) -> dict[str, dict[str, float]]:
         grouped: dict[str, dict[str, float]] = {}
@@ -1619,6 +1791,31 @@ class Codebook:
                 f"scale_max:{float(stats.get('scale_max', 0.0)):.3e}",
                 f"metric_diag_mean:{float(stats.get('metric_diag_mean', 0.0)):.3e}",
             ]
+            if "scale_p01" in stats:
+                parts.extend(
+                    [
+                        f"scale_p01:{float(stats.get('scale_p01', 0.0)):.3e}",
+                        f"scale_p50:{float(stats.get('scale_p50', 0.0)):.3e}",
+                        f"scale_p99:{float(stats.get('scale_p99', 0.0)):.3e}",
+                    ]
+                )
+            if "residual_code_norm_max" in stats:
+                parts.extend(
+                    [
+                        f"residual_code_norm_max:{float(stats.get('residual_code_norm_max', 0.0)):.3e}",
+                        f"residual_tangent_p95:{float(stats.get('residual_tangent_norm_p95', 0.0)):.3e}",
+                        f"parallel_frac:{float(stats.get('residual_parallel_frac_mean', 0.0)):.3e}",
+                    ]
+                )
+            if "scale_clip_low_frac" in stats:
+                parts.extend(
+                    [
+                        f"scale_clip_low_frac:{float(stats.get('scale_clip_low_frac', 0.0)):.3e}",
+                        f"scale_clip_high_frac:{float(stats.get('scale_clip_high_frac', 0.0)):.3e}",
+                    ]
+                )
+            if "export_residual_fp16_saturations" in stats:
+                parts.append(f"residual_fp16_sat:{int(stats.get('export_residual_fp16_saturations', 0))}")
             if "payload_bytes" in stats:
                 parts.extend(
                     [
@@ -1718,15 +1915,21 @@ class Codebook:
         dtype: torch.dtype,
     ) -> tuple[Tensor, Tensor, Tensor]:
         fixed_blocks = self._decode_fixed_blocks(state, device=device, dtype=dtype)
+        fixed_dirs, _ = normalize_blocks(fixed_blocks)
         if self.h.codebook_use_residual:
             residual_codebook = state["residual_codebook"].to(device=device, dtype=dtype)
             residual_idx = state["residual_idx"].to(device=device)
             residual_blocks = codebook_lookup(residual_idx, residual_codebook)
+            residual_dirs, _, _, _ = compose_directional_blocks(
+                fixed_blocks,
+                residual_blocks,
+                max_norm=self._residual_max_norm(),
+            )
         else:
-            residual_blocks = torch.zeros_like(fixed_blocks)
+            residual_dirs = fixed_dirs
         scales = self._scales(state, device=device, dtype=dtype)
-        fixed_rotated = fixed_blocks * scales
-        residual_rotated = (fixed_blocks + residual_blocks) * scales
+        fixed_rotated = fixed_dirs * scales
+        residual_rotated = residual_dirs * scales
         final_rotated = residual_rotated + self._outlier_delta(state, device=device, dtype=dtype)
         return fixed_rotated, residual_rotated, final_rotated
 
@@ -1812,9 +2015,11 @@ class Codebook:
         state: dict[str, object],
         residual_blocks: Tensor,
         metrics: Tensor,
+        block_weights: Tensor,
     ) -> None:
         points = self._flatten_blocks(residual_blocks)
         weights = self._metric_point_weights(metrics, int(state["num_rows"])).to(device=points.device, dtype=torch.float32)
+        weights = weights * block_weights.reshape(-1).to(device=points.device, dtype=torch.float32).clamp_min(1e-8)
         codebook = run_weighted_lloyd_kmeans(
             points,
             weights,
@@ -1823,6 +2028,17 @@ class Codebook:
             str(state["name"]),
             "residual",
         )
+        codebook = self._stabilize_residual_codebook(codebook)
+        init_refine_iters = min(2, max(self.h.codebook_init_kmeans_iters, 1))
+        for _ in range(init_refine_iters):
+            assignments = self._metric_assign_codewords(residual_blocks, metrics, codebook)
+            codebook = self._weighted_codebook_update(
+                residual_blocks,
+                assignments,
+                metrics,
+                codebook,
+                block_weights=block_weights,
+            )
         state["residual_codebook"].copy_(
             codebook.to(device=state["residual_codebook"].device, dtype=state["residual_codebook"].dtype)
         )
@@ -1830,43 +2046,64 @@ class Codebook:
     @torch.no_grad()
     def _assign_residual_with_scale(
         self,
-        normalized_blocks: Tensor,
         rotated_blocks: Tensor,
         fixed_blocks: Tensor,
+        scales: Tensor,
         residual_codebook: Tensor,
         metrics: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor]:
+        if not self.h.codebook_use_residual:
+            empty_idx = torch.zeros(
+                rotated_blocks.shape[:2],
+                device=rotated_blocks.device,
+                dtype=torch.long,
+            )
+            return empty_idx, torch.zeros_like(rotated_blocks), scales
+        if residual_codebook.shape[0] == 0:
+            empty_idx = torch.zeros(
+                rotated_blocks.shape[:2],
+                device=rotated_blocks.device,
+                dtype=torch.long,
+            )
+            return empty_idx, torch.zeros_like(rotated_blocks), scales
+        target_dirs, _ = normalize_blocks(rotated_blocks)
+        base_dirs, _ = normalize_blocks(fixed_blocks)
+        target_tangent = directional_tangent_targets(
+            target_dirs,
+            base_dirs,
+            max_norm=self._residual_max_norm(),
+        )
         topk = min(self.h.codebook_ldlq_topk, residual_codebook.shape[0])
-        target_norm = normalized_blocks - fixed_blocks
-        target_norm_metric = torch.einsum("npd,pde->npe", target_norm, metrics)
+        target_norm_metric = torch.einsum("npd,pde->npe", target_tangent, metrics)
         codebook_metric = torch.einsum("kd,pde->pke", residual_codebook, metrics)
         dists = (
-            (target_norm_metric * target_norm).sum(dim=-1, keepdim=True)
+            (target_norm_metric * target_tangent).sum(dim=-1, keepdim=True)
             - 2.0 * torch.matmul(target_norm_metric, residual_codebook.t())
             + (codebook_metric * residual_codebook.unsqueeze(0)).sum(dim=-1).unsqueeze(0)
         )
         topk_idx = torch.topk(dists, k=topk, largest=False, dim=-1).indices
-        block_dim = normalized_blocks.shape[-1]
+        block_dim = rotated_blocks.shape[-1]
         candidates = residual_codebook[topk_idx]
-        base = fixed_blocks.unsqueeze(2) + candidates
+        candidate_dirs, _, candidate_tangent, _ = compose_directional_blocks(
+            base_dirs.unsqueeze(2),
+            candidates,
+            max_norm=self._residual_max_norm(),
+        )
+        candidate_blocks = candidate_dirs * scales.unsqueeze(2)
         target_metric = torch.einsum("npd,pde->npe", rotated_blocks, metrics)
-        base_metric = torch.einsum("nptd,pde->npte", base, metrics)
-        numer = (target_metric.unsqueeze(2) * base).sum(dim=-1)
-        denom = (base_metric * base).sum(dim=-1).clamp_min(1e-8)
-        candidate_scales = (numer / denom).clamp_min(1e-8)
+        base_metric = torch.einsum("nptd,pde->npte", candidate_blocks, metrics)
+        numer = (target_metric.unsqueeze(2) * candidate_blocks).sum(dim=-1)
+        denom = (base_metric * candidate_blocks).sum(dim=-1)
         target_quad = (target_metric * rotated_blocks).sum(dim=-1, keepdim=True)
-        errors = target_quad - 2.0 * candidate_scales * numer + candidate_scales.square() * denom
+        errors = target_quad - 2.0 * numer + denom
         best = errors.argmin(dim=-1)
         gather_idx = best.unsqueeze(-1)
         residual_idx = topk_idx.gather(2, gather_idx).squeeze(-1)
-        residual_vals = candidates.gather(
+        residual_vals = candidate_tangent.gather(
             2,
             gather_idx.unsqueeze(-1).expand(-1, -1, 1, block_dim),
         ).squeeze(2)
-        best_numer = numer.gather(2, gather_idx).squeeze(-1)
-        best_denom = denom.gather(2, gather_idx).squeeze(-1)
-        scales = (best_numer / best_denom).clamp_min(1e-8)
-        return residual_idx, residual_vals, scales.unsqueeze(-1)
+        return residual_idx, residual_vals, scales
 
     @torch.no_grad()
     def _weighted_codebook_update(
@@ -1875,21 +2112,28 @@ class Codebook:
         assignments: Tensor,
         metrics: Tensor,
         prev_codebook: Tensor,
+        block_weights: Tensor | None = None,
     ) -> Tensor:
         k, block_dim = prev_codebook.shape
         eye = torch.eye(block_dim, device=targets.device, dtype=torch.float32)
         one_hot = F.one_hot(assignments.long(), num_classes=k).to(dtype=torch.float32)
+        if block_weights is None:
+            block_weights = torch.ones(targets.shape[:2], device=targets.device, dtype=torch.float32)
+        else:
+            block_weights = block_weights.to(device=targets.device, dtype=torch.float32).clamp_min(1e-8)
+        one_hot = one_hot * block_weights.unsqueeze(-1)
         counts_by_pos = one_hot.sum(dim=0)
         counts = counts_by_pos.sum(dim=0)
         system = torch.einsum("pk,pde->kde", counts_by_pos, metrics)
-        system = system + eye.unsqueeze(0) * 1e-6
+        ridge = counts_by_pos.sum(dim=0).clamp_min(1e-8) * self.h.codebook_residual_ridge
+        system = system + eye.unsqueeze(0) * ridge.view(-1, 1, 1)
         metric_targets = torch.einsum("npd,pde->npe", targets, metrics)
         rhs = torch.einsum("npk,npe->ke", one_hot, metric_targets)
         updated = prev_codebook.to(device=targets.device, dtype=torch.float32).clone()
         mask = counts > 0
         if mask.any():
             updated[mask] = torch.linalg.solve(system[mask], rhs[mask])
-        return updated
+        return self._stabilize_residual_codebook(updated)
 
     @torch.no_grad()
     def _local_assign_blocks(
@@ -1902,6 +2146,7 @@ class Codebook:
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         scales = initial_scales
         residual_vals = torch.zeros_like(rotated_blocks)
+        target_dirs, _ = normalize_blocks(rotated_blocks)
         fixed_idx = torch.zeros(
             int(state["num_rows"]),
             int(state["num_positions"]),
@@ -1911,33 +2156,31 @@ class Codebook:
         fixed_vals = torch.zeros_like(rotated_blocks)
         residual_idx = torch.zeros_like(fixed_idx)
         for _ in range(self.h.codebook_ldlq_iters):
-            normalized_adjusted = rotated_blocks / scales - residual_vals
+            normalized_adjusted, _ = normalize_blocks(target_dirs - residual_vals)
             fixed_flat, fixed_idx_flat = _quantize_e8p_blocks(
                 self._flatten_blocks(normalized_adjusted),
                 self.h.codebook_lattice_scale,
             )
             fixed_vals = self._block_grid(state, fixed_flat)
             fixed_idx = fixed_idx_flat.view(int(state["num_rows"]), int(state["num_positions"]))
-            normalized_blocks = rotated_blocks / scales
             residual_idx, residual_vals, scales = self._assign_residual_with_scale(
-                normalized_blocks,
                 rotated_blocks,
                 fixed_vals,
+                scales,
                 residual_codebook,
                 metrics,
             )
-        normalized_adjusted = rotated_blocks / scales - residual_vals
+        normalized_adjusted, _ = normalize_blocks(target_dirs - residual_vals)
         fixed_flat, fixed_idx_flat = _quantize_e8p_blocks(
             self._flatten_blocks(normalized_adjusted),
             self.h.codebook_lattice_scale,
         )
         fixed_vals = self._block_grid(state, fixed_flat)
         fixed_idx = fixed_idx_flat.view(int(state["num_rows"]), int(state["num_positions"]))
-        normalized_blocks = rotated_blocks / scales
         residual_idx, residual_vals, scales = self._assign_residual_with_scale(
-            normalized_blocks,
             rotated_blocks,
             fixed_vals,
+            scales,
             residual_codebook,
             metrics,
         )
@@ -2014,15 +2257,47 @@ class Codebook:
         residual_rel_mse = residual_mse / energy
         final_rel_mse = final_mse / energy
         scales = self._scales(state, device=rotated_blocks.device, dtype=torch.float32)
+        scale_flat = scales.reshape(-1)
+        scale_p01 = float(torch.quantile(scale_flat, 0.01).item()) if scale_flat.numel() else 0.0
+        scale_p50 = float(torch.quantile(scale_flat, 0.50).item()) if scale_flat.numel() else 0.0
+        scale_p99 = float(torch.quantile(scale_flat, 0.99).item()) if scale_flat.numel() else 0.0
+        fixed_blocks = self._decode_fixed_blocks(state, device=rotated_blocks.device, dtype=torch.float32)
         if self.h.codebook_use_residual:
             counts_residual = torch.bincount(
                 state["residual_idx"].to(device=rotated_blocks.device),
                 minlength=self.h.codebook_residual_k,
             ).to(torch.float32)
             used_residual = int((counts_residual > 0).sum().item())
+            residual_codebook = state["residual_codebook"].to(device=rotated_blocks.device, dtype=torch.float32)
+            residual_code_norms = residual_codebook.norm(dim=-1)
+            assigned_residual = codebook_lookup(
+                state["residual_idx"].to(device=rotated_blocks.device),
+                residual_codebook,
+            )
+            _, _, residual_tangent, parallel = compose_directional_blocks(
+                fixed_blocks,
+                assigned_residual,
+                max_norm=self._residual_max_norm(),
+            )
+            residual_tangent_norms = residual_tangent.norm(dim=-1)
+            parallel_frac = parallel.abs().squeeze(-1) / assigned_residual.norm(dim=-1).clamp_min(1e-8)
+            residual_code_norm_p50 = float(torch.quantile(residual_code_norms, 0.50).item()) if residual_code_norms.numel() else 0.0
+            residual_code_norm_p95 = float(torch.quantile(residual_code_norms, 0.95).item()) if residual_code_norms.numel() else 0.0
+            residual_code_norm_max = float(residual_code_norms.max().item()) if residual_code_norms.numel() else 0.0
+            residual_tangent_norm_p50 = float(torch.quantile(residual_tangent_norms, 0.50).item()) if residual_tangent_norms.numel() else 0.0
+            residual_tangent_norm_p95 = float(torch.quantile(residual_tangent_norms, 0.95).item()) if residual_tangent_norms.numel() else 0.0
+            residual_tangent_norm_max = float(residual_tangent_norms.max().item()) if residual_tangent_norms.numel() else 0.0
+            residual_parallel_frac_mean = float(parallel_frac.mean().item()) if parallel_frac.numel() else 0.0
         else:
             counts_residual = torch.zeros(self.h.codebook_residual_k, device=rotated_blocks.device, dtype=torch.float32)
             used_residual = 0
+            residual_code_norm_p50 = 0.0
+            residual_code_norm_p95 = 0.0
+            residual_code_norm_max = 0.0
+            residual_tangent_norm_p50 = 0.0
+            residual_tangent_norm_p95 = 0.0
+            residual_tangent_norm_max = 0.0
+            residual_parallel_frac_mean = 0.0
         num_blocks = int(state["fixed_idx"].numel())
         fixed_raw_bits = _hybrid_fixed_raw_bits(num_blocks)
         scale_raw_bits = _hybrid_scale_raw_bits(num_blocks, self.h)
@@ -2046,6 +2321,9 @@ class Codebook:
             "scale_min": float(scales.min().item()),
             "scale_max": float(scales.max().item()),
             "scale_mean": float(scales.mean().item()),
+            "scale_p01": scale_p01,
+            "scale_p50": scale_p50,
+            "scale_p99": scale_p99,
             "used_residual": used_residual,
             "outlier_blocks": int(state["outlier_positions"].numel()),
             "fixed_raw_bits": fixed_raw_bits,
@@ -2057,6 +2335,13 @@ class Codebook:
             "outlier_raw_bits": outlier_raw_bits,
             "outlier_raw_bpw": outlier_raw_bits / max(float(weight.numel()), 1.0),
             "hist_residual": counts_residual.to(torch.int64).cpu().tolist(),
+            "residual_code_norm_p50": residual_code_norm_p50,
+            "residual_code_norm_p95": residual_code_norm_p95,
+            "residual_code_norm_max": residual_code_norm_max,
+            "residual_tangent_norm_p50": residual_tangent_norm_p50,
+            "residual_tangent_norm_p95": residual_tangent_norm_p95,
+            "residual_tangent_norm_max": residual_tangent_norm_max,
+            "residual_parallel_frac_mean": residual_parallel_frac_mean,
         }
 
     @torch.no_grad()
@@ -2068,20 +2353,30 @@ class Codebook:
         rotated_blocks = self._block_grid(state, self._rotated_blocks(state, module.weight.detach()).float())
         metrics = self._block_metrics_from_hessian(state, hessian, device=rotated_blocks.device)
         metric_diag = metrics.diagonal(dim1=-2, dim2=-1)
-        initial_scales = rotated_blocks.norm(dim=-1, keepdim=True).clamp_min(1e-8)
-        normalized_blocks = rotated_blocks / initial_scales
+        target_dirs, target_scales = normalize_blocks(rotated_blocks)
+        scale_weights = target_scales.squeeze(-1).square()
         fixed_flat, fixed_idx_flat = _quantize_e8p_blocks(
-            self._flatten_blocks(normalized_blocks),
+            self._flatten_blocks(target_dirs),
             self.h.codebook_lattice_scale,
         )
         fixed_blocks = self._block_grid(state, fixed_flat)
         state["fixed_idx"].copy_(fixed_idx_flat.to(device=state["fixed_idx"].device))
         state["log_scales"].copy_(
-            initial_scales.reshape(-1, 1).log().to(device=state["log_scales"].device, dtype=state["log_scales"].dtype)
+            target_scales.reshape(-1, 1).log().to(device=state["log_scales"].device, dtype=state["log_scales"].dtype)
         )
         if self.h.codebook_use_residual:
-            residual_seed = normalized_blocks - fixed_blocks
-            self._initialize_residual_codebook(state, residual_seed, metrics)
+            fixed_dirs, _ = normalize_blocks(fixed_blocks)
+            residual_seed = directional_tangent_targets(
+                target_dirs,
+                fixed_dirs,
+                max_norm=self._residual_max_norm(),
+            )
+            self._initialize_residual_codebook(
+                state,
+                residual_seed,
+                metrics,
+                block_weights=scale_weights,
+            )
 
         for _ in range(max(self.h.codebook_refinement_iters, 1) if self.h.codebook_use_residual else 0):
             residual_codebook = state["residual_codebook"].to(device=rotated_blocks.device, dtype=torch.float32)
@@ -2090,19 +2385,24 @@ class Codebook:
                 rotated_blocks,
                 metrics,
                 residual_codebook,
-                initial_scales,
+                target_scales,
             )
-            residual_targets = rotated_blocks / scales - fixed_blocks
+            fixed_dirs, _ = normalize_blocks(fixed_blocks)
+            residual_targets = directional_tangent_targets(
+                target_dirs,
+                fixed_dirs,
+                max_norm=self._residual_max_norm(),
+            )
             updated_codebook = self._weighted_codebook_update(
                 residual_targets,
                 residual_idx,
                 metrics,
                 residual_codebook,
+                block_weights=scale_weights,
             )
             state["residual_codebook"].copy_(
                 updated_codebook.to(device=state["residual_codebook"].device, dtype=state["residual_codebook"].dtype)
             )
-            initial_scales = scales
 
         if not self.h.codebook_use_residual:
             state["residual_codebook"].zero_()
@@ -2112,7 +2412,7 @@ class Codebook:
             rotated_blocks,
             metrics,
             residual_codebook,
-            initial_scales,
+            target_scales,
         )
         state["fixed_idx"].copy_(fixed_idx.reshape(-1).to(device=state["fixed_idx"].device))
         if self.h.codebook_use_residual:
@@ -2121,9 +2421,14 @@ class Codebook:
             state["residual_idx"].zero_()
             residual_vals = torch.zeros_like(fixed_blocks)
         state["log_scales"].copy_(
-            scales.reshape(-1, 1).log().to(device=state["log_scales"].device, dtype=state["log_scales"].dtype)
+            target_scales.reshape(-1, 1).log().to(device=state["log_scales"].device, dtype=state["log_scales"].dtype)
         )
-        residual_rotated = (fixed_blocks + residual_vals) * scales
+        residual_dirs, _, _, _ = compose_directional_blocks(
+            fixed_blocks,
+            residual_vals,
+            max_norm=self._residual_max_norm(),
+        )
+        residual_rotated = residual_dirs * target_scales
         self._select_outliers(state, rotated_blocks, residual_rotated, metrics)
 
         stats = self._snapshot_stats(state, module.weight.detach())
@@ -2173,18 +2478,30 @@ class Codebook:
         total_outlier_raw_bits = sum(int(stats["outlier_raw_bits"]) for _, stats in fitted_items)
         total_outlier_blocks = sum(int(stats["outlier_blocks"]) for _, stats in fitted_items)
         total_blocks = sum(int(stats["num_blocks"]) for _, stats in fitted_items)
+        self.last_fit_summary = {
+            "fixed_rel_mse": weighted_fixed_rel_mse / max(total_target_weights, 1),
+            "residual_rel_mse": weighted_residual_rel_mse / max(total_target_weights, 1),
+            "final_rel_mse": weighted_rel_mse / max(total_target_weights, 1),
+            "target_raw_bpw": total_raw_bits / max(total_target_weights, 1),
+            "fixed_raw_bpw": total_fixed_raw_bits / max(total_target_weights, 1),
+            "scale_raw_bpw": total_scale_raw_bits / max(total_target_weights, 1),
+            "residual_raw_bpw": total_residual_raw_bits / max(total_target_weights, 1),
+            "outlier_raw_bpw": total_outlier_raw_bits / max(total_target_weights, 1),
+            "outlier_frac": total_outlier_blocks / max(total_blocks, 1),
+        }
         if self.h.is_main_process:
             log(
-                f"codebook:fit_summary fixed_rel_mse:{weighted_fixed_rel_mse / max(total_target_weights, 1):.6e} "
-                f"residual_rel_mse:{weighted_residual_rel_mse / max(total_target_weights, 1):.6e} "
-                f"final_rel_mse:{weighted_rel_mse / max(total_target_weights, 1):.6e} "
-                f"target_raw_bpw:{total_raw_bits / max(total_target_weights, 1):.4f} "
-                f"fixed_raw_bpw:{total_fixed_raw_bits / max(total_target_weights, 1):.4f} "
-                f"scale_raw_bpw:{total_scale_raw_bits / max(total_target_weights, 1):.4f} "
-                f"residual_raw_bpw:{total_residual_raw_bits / max(total_target_weights, 1):.4f} "
-                f"outlier_raw_bpw:{total_outlier_raw_bits / max(total_target_weights, 1):.4f} "
-                f"outlier_frac:{total_outlier_blocks / max(total_blocks, 1):.4%}"
+                f"codebook:fit_summary fixed_rel_mse:{self.last_fit_summary['fixed_rel_mse']:.6e} "
+                f"residual_rel_mse:{self.last_fit_summary['residual_rel_mse']:.6e} "
+                f"final_rel_mse:{self.last_fit_summary['final_rel_mse']:.6e} "
+                f"target_raw_bpw:{self.last_fit_summary['target_raw_bpw']:.4f} "
+                f"fixed_raw_bpw:{self.last_fit_summary['fixed_raw_bpw']:.4f} "
+                f"scale_raw_bpw:{self.last_fit_summary['scale_raw_bpw']:.4f} "
+                f"residual_raw_bpw:{self.last_fit_summary['residual_raw_bpw']:.4f} "
+                f"outlier_raw_bpw:{self.last_fit_summary['outlier_raw_bpw']:.4f} "
+                f"outlier_frac:{self.last_fit_summary['outlier_frac']:.4%}"
             )
+            self._log_invariant_stats("codebook:fit_invariants", fitted_items)
             self._log_group_stats("codebook:fit_groups", fitted_items)
             self._log_top_tensor_stats("codebook:fit_top", fitted_items, sort_key="rel_mse")
 
@@ -2209,6 +2526,7 @@ class Codebook:
         residual_fallback_tensors = 0
         residual_fallback_nonfinite = 0
         residual_fallback_worse = 0
+        residual_fp16_saturations_total = 0
         total_fp_weights = sum(
             int(t.numel())
             for _, t in state_dict.items()
@@ -2220,9 +2538,20 @@ class Codebook:
                 state = self.states[name]
                 fixed_idx_cpu = state["fixed_idx"].long().cpu()
                 residual_idx_cpu = state["residual_idx"].long().cpu()
-                residual_codebook_cpu = state["residual_codebook"].to(torch.float16).cpu().contiguous()
+                residual_codebook_fp32 = state["residual_codebook"].to(device=torch.device("cpu"), dtype=torch.float32)
+                residual_fp16_limit = float(torch.finfo(torch.float16).max)
+                residual_fp16_saturations = int(
+                    (~torch.isfinite(residual_codebook_fp32)).sum().item()
+                    + (residual_codebook_fp32.abs() > residual_fp16_limit).sum().item()
+                )
+                residual_codebook_cpu = self._stabilize_residual_codebook(residual_codebook_fp32).to(torch.float16).contiguous()
                 scales_cpu = self._scales(state, device=torch.device("cpu"), dtype=torch.float32)
-                scale_codes, scale_meta = quantize_log_scales(scales_cpu, self.h.codebook_scale_bits)
+                scale_codes, scale_meta = quantize_log_scales(
+                    scales_cpu,
+                    self.h.codebook_scale_bits,
+                    q_lo=self.h.codebook_scale_q_lo,
+                    q_hi=self.h.codebook_scale_q_hi,
+                )
                 packed_fixed_idx = _pack_codes(fixed_idx_cpu, 16).cpu().contiguous()
                 packed_scales = _pack_codes(scale_codes, self.h.codebook_scale_bits).cpu().contiguous()
                 quantized_scales = dequantize_log_scales(
@@ -2239,8 +2568,9 @@ class Codebook:
                     device=torch.device("cpu"),
                     dtype=torch.float32,
                 )
+                fixed_dirs_cpu, _ = normalize_blocks(fixed_blocks_cpu)
                 target_rotated = self._rotated_blocks(state, t).float().cpu()
-                fixed_rotated = fixed_blocks_cpu * quantized_scales
+                fixed_rotated = fixed_dirs_cpu * quantized_scales
                 fixed_diff = target_rotated - fixed_rotated
                 fixed_mse = float(fixed_diff.square().mean().item())
                 target_energy = max(float(target_rotated.square().mean().item()), 1e-12)
@@ -2254,7 +2584,12 @@ class Codebook:
                 residual_rel_mse = fixed_rel_mse
                 if use_residual_export:
                     residual_blocks_candidate = codebook_lookup(residual_idx_cpu, residual_codebook_cpu.float())
-                    residual_rotated_candidate = (fixed_blocks_cpu + residual_blocks_candidate) * quantized_scales
+                    residual_dirs_candidate, _, _, _ = compose_directional_blocks(
+                        fixed_blocks_cpu,
+                        residual_blocks_candidate,
+                        max_norm=self._residual_max_norm(),
+                    )
+                    residual_rotated_candidate = residual_dirs_candidate * quantized_scales
                     residual_diff_candidate = target_rotated - residual_rotated_candidate
                     residual_mse_candidate = float(residual_diff_candidate.square().mean().item())
                     residual_rel_mse_candidate = residual_mse_candidate / target_energy
@@ -2305,6 +2640,15 @@ class Codebook:
                         final_rotated = base_rotated
                         final_mse = residual_mse if use_residual_export else fixed_mse
                         final_rel_mse = residual_rel_mse if use_residual_export else fixed_rel_mse
+                scale_levels = 1 << self.h.codebook_scale_bits
+                scale_num_codes = max(int(scale_codes.numel()), 1)
+                scale_clip_low_frac = float(scale_meta.get("clip_low_count", 0)) / scale_num_codes
+                scale_clip_high_frac = float(scale_meta.get("clip_high_count", 0)) / scale_num_codes
+                scale_code_floor_frac = float((scale_codes == 0).to(torch.float32).mean().item()) if scale_codes.numel() else 0.0
+                scale_code_ceiling_frac = (
+                    float((scale_codes == (scale_levels - 1)).to(torch.float32).mean().item())
+                    if scale_codes.numel() else 0.0
+                )
                 result[name + ".fi"] = packed_fixed_idx
                 result[name + ".s"] = packed_scales
                 if use_residual_export:
@@ -2330,6 +2674,7 @@ class Codebook:
                     "scale_bits": self.h.codebook_scale_bits,
                     "scale_log_min": scale_meta["log_min"],
                     "scale_log_max": scale_meta["log_max"],
+                    "residual_max_norm": float(self._residual_max_norm()),
                     "outlier_enabled": use_outliers_export,
                     "outlier_count": outlier_count,
                     "outlier_position_bits": outlier_position_bits,
@@ -2396,10 +2741,16 @@ class Codebook:
                         "residual_fallback_reason": residual_fallback_reason,
                         "scale_log_min": scale_meta["log_min"],
                         "scale_log_max": scale_meta["log_max"],
+                        "scale_clip_low_frac": scale_clip_low_frac,
+                        "scale_clip_high_frac": scale_clip_high_frac,
+                        "scale_code_floor_frac": scale_code_floor_frac,
+                        "scale_code_ceiling_frac": scale_code_ceiling_frac,
+                        "export_residual_fp16_saturations": residual_fp16_saturations,
                     }
                 )
                 total_raw_bits += raw_bits
                 total_target_weights += int(state_export_stats["num_weights"])
+                residual_fp16_saturations_total += residual_fp16_saturations
                 export_stats["tensors"][name] = state_export_stats
                 continue
             if not t.is_floating_point() or t.numel() <= 65536:
@@ -2453,6 +2804,7 @@ class Codebook:
             "residual_fallback_tensors": residual_fallback_tensors,
             "residual_fallback_nonfinite": residual_fallback_nonfinite,
             "residual_fallback_worse": residual_fallback_worse,
+            "residual_fp16_saturations": residual_fp16_saturations_total,
         }
         export_stats["groups"] = self._aggregate_group_stats(
             [(name, stats) for name, stats in export_stats["tensors"].items()]
@@ -2516,13 +2868,19 @@ def dequantize_state_dict_codebook(
             device=torch.device("cpu"),
             dtype=torch.float32,
         )
+        fixed_dirs, _ = normalize_blocks(fixed_blocks)
         if bool(info.get("residual_enabled", True)):
             residual_codebook = result[name + ".rc"].to(dtype=torch.float32)
             residual_idx = _unpack_codes(result[name + ".ri"], int(info["residual_bits"]), num_blocks)
             residual_blocks = codebook_lookup(residual_idx, residual_codebook)
+            residual_dirs, _, _, _ = compose_directional_blocks(
+                fixed_blocks,
+                residual_blocks,
+                max_norm=float(info.get("residual_max_norm", 1.0)),
+            )
         else:
-            residual_blocks = torch.zeros_like(fixed_blocks)
-        rotated_blocks = (fixed_blocks + residual_blocks) * scales
+            residual_dirs = fixed_dirs
+        rotated_blocks = residual_dirs * scales
         outlier_count = int(info.get("outlier_count", 0))
         if outlier_count > 0:
             positions = _unpack_codes(result[name + ".op"], int(info["outlier_position_bits"]), outlier_count)
@@ -2664,6 +3022,7 @@ def serialize(
             f"int8_fallback_weights:{summary.get('int8_fallback_weights', 0)} "
             f"passthrough_bytes:{summary.get('passthrough_payload_bytes', 0)} "
             f"passthrough_weights:{summary.get('passthrough_weights', 0)} "
+            f"residual_fp16_saturations:{summary.get('residual_fp16_saturations', 0)} "
             f"effective_payload_bpw_all_weights:{summary.get('effective_payload_bpw_all_weights', 0.0):.4f} "
             f"effective_compressed_bpw_all_weights:{(8.0 * quant_file_bytes) / max(summary.get('model_fp_weights', 1), 1):.4f}"
         )
@@ -2683,12 +3042,28 @@ def serialize(
             )
         if len(group_parts) > 1:
             log(" ".join(group_parts))
+        if quantizer.last_fit_summary:
+            export_tensor_items = list(quant_stats.get("tensors", {}).items())
+            total_export_weights = sum(int(stats.get("num_weights", 0)) for _, stats in export_tensor_items)
+            weighted_export_rel_mse = sum(
+                float(stats.get("rel_mse", 0.0)) * int(stats.get("num_weights", 0))
+                for _, stats in export_tensor_items
+            ) / max(total_export_weights, 1)
+            log(
+                f"codebook:gap_summary fit_rel_mse:{quantizer.last_fit_summary.get('final_rel_mse', 0.0):.6e} "
+                f"export_rel_mse:{weighted_export_rel_mse:.6e} "
+                f"delta_rel_mse:{weighted_export_rel_mse - quantizer.last_fit_summary.get('final_rel_mse', 0.0):.6e}"
+            )
         if summary.get("residual_fallback_tensors", 0) > 0:
             log(
                 f"codebook:export_residual_fallbacks tensors:{summary.get('residual_fallback_tensors', 0)} "
                 f"nonfinite:{summary.get('residual_fallback_nonfinite', 0)} "
                 f"worse_than_fixed:{summary.get('residual_fallback_worse', 0)}"
             )
+        quantizer._log_invariant_stats(
+            "codebook:export_invariants",
+            list(quant_stats.get("tensors", {}).items()),
+        )
         quantizer._log_top_tensor_stats(
             "codebook:export_top_error",
             list(quant_stats.get("tensors", {}).items()),
