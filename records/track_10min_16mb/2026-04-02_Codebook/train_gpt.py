@@ -120,6 +120,9 @@ class Hyperparameters():
     # Compression
     compressor = os.environ.get('COMPRESSOR', 'brotli')  #(lzma or brotli)
     codebook_block_dim = int(os.environ.get("CODEBOOK_BLOCK_DIM", 8))
+    codebook_use_hadamard = bool(int(os.environ.get("CODEBOOK_USE_HADAMARD", "1")))
+    codebook_use_residual = bool(int(os.environ.get("CODEBOOK_USE_RESIDUAL", "1")))
+    codebook_use_outliers = bool(int(os.environ.get("CODEBOOK_USE_OUTLIERS", "1")))
     codebook_residual_k = int(os.environ.get("CODEBOOK_RESIDUAL_K", 16))
     codebook_scale_bits = int(os.environ.get("CODEBOOK_SCALE_BITS", 6))
     codebook_init_kmeans_iters = int(os.environ.get("CODEBOOK_INIT_KMEANS_ITERS", 8))
@@ -1010,12 +1013,16 @@ def _hadamard_sign_vector(name: str, block_dim: int, *, device: torch.device, dt
     )
 
 
-def hadamard_rotate_blocks(blocks: Tensor, sign_vec: Tensor) -> Tensor:
+def hadamard_rotate_blocks(blocks: Tensor, sign_vec: Tensor, *, enabled: bool = True) -> Tensor:
+    if not enabled:
+        return blocks
     scale = blocks.shape[-1] ** -0.5
     return hadamard_transform(blocks * sign_vec, scale=scale)
 
 
-def hadamard_unrotate_blocks(blocks: Tensor, sign_vec: Tensor) -> Tensor:
+def hadamard_unrotate_blocks(blocks: Tensor, sign_vec: Tensor, *, enabled: bool = True) -> Tensor:
+    if not enabled:
+        return blocks
     scale = blocks.shape[-1] ** -0.5
     return hadamard_transform(blocks, scale=scale) * sign_vec
 
@@ -1260,19 +1267,27 @@ def _validate_codebook_hparams(h: Hyperparameters) -> None:
 
 
 def _hybrid_base_raw_bits(num_blocks: int, h: Hyperparameters) -> int:
-    residual_idx_bits = _bits_for_size(h.codebook_residual_k)
-    residual_codebook_bits = h.codebook_residual_k * h.codebook_block_dim * 16
-    return num_blocks * (16 + residual_idx_bits + h.codebook_scale_bits) + residual_codebook_bits
+    return (
+        _hybrid_fixed_raw_bits(num_blocks)
+        + _hybrid_scale_raw_bits(num_blocks, h)
+        + _hybrid_residual_raw_bits(num_blocks, h)
+    )
 
 
 def _hybrid_fixed_raw_bits(num_blocks: int) -> int:
     return num_blocks * 16
 
 
+def _hybrid_scale_raw_bits(num_blocks: int, h: Hyperparameters) -> int:
+    return num_blocks * h.codebook_scale_bits
+
+
 def _hybrid_residual_raw_bits(num_blocks: int, h: Hyperparameters) -> int:
+    if not h.codebook_use_residual:
+        return 0
     residual_idx_bits = _bits_for_size(h.codebook_residual_k)
     residual_codebook_bits = h.codebook_residual_k * h.codebook_block_dim * 16
-    return num_blocks * (residual_idx_bits + h.codebook_scale_bits) + residual_codebook_bits
+    return num_blocks * residual_idx_bits + residual_codebook_bits
 
 
 class Codebook:
@@ -1291,6 +1306,9 @@ class Codebook:
                 self.target_names.add(weight_name)
         if self.target_modules:
             _get_e8p_codebook(self.target_modules[0][1].weight.device)
+
+    def _active_residual_k(self) -> int:
+        return self.h.codebook_residual_k if self.h.codebook_use_residual else 0
 
     @staticmethod
     def _tensor_group(name: str) -> str | None:
@@ -1334,7 +1352,7 @@ class Codebook:
             bucket["num_weights"] += num_weights
             bucket["num_blocks"] += float(stats["num_blocks"])
             bucket["outlier_blocks"] += float(stats["outlier_blocks"])
-            bucket["used_residual_frac_sum"] += float(stats["used_residual"]) / max(float(self.h.codebook_residual_k), 1.0)
+            bucket["used_residual_frac_sum"] += float(stats["used_residual"]) / max(float(self._active_residual_k()), 1.0)
             bucket["num_tensors"] += 1.0
         summary: dict[str, dict[str, float]] = {}
         for group, bucket in grouped.items():
@@ -1390,8 +1408,9 @@ class Codebook:
                 f"residual_rel_mse:{float(stats.get('residual_rel_mse', 0.0)):.6e}",
                 f"final_rel_mse:{float(stats.get('rel_mse', 0.0)):.6e}",
                 f"outliers:{int(stats.get('outlier_blocks', 0))}/{int(stats.get('num_blocks', 1))}",
-                f"used_residual:{int(stats.get('used_residual', 0))}/{self.h.codebook_residual_k}",
+                f"used_residual:{int(stats.get('used_residual', 0))}/{self._active_residual_k()}",
                 f"fixed_raw_bpw:{float(stats.get('fixed_raw_bpw', 0.0)):.4f}",
+                f"scale_raw_bpw:{float(stats.get('scale_raw_bpw', 0.0)):.4f}",
                 f"residual_raw_bpw:{float(stats.get('residual_raw_bpw', 0.0)):.4f}",
                 f"outlier_raw_bpw:{float(stats.get('outlier_raw_bpw', 0.0)):.4f}",
                 f"scale_min:{float(stats.get('scale_min', 0.0)):.3e}",
@@ -1404,6 +1423,7 @@ class Codebook:
                     [
                         f"payload_bytes:{int(stats['payload_bytes'])}",
                         f"fixed_payload:{int(stats.get('fixed_payload_bytes', 0))}",
+                        f"scale_payload:{int(stats.get('scale_payload_bytes', 0))}",
                         f"residual_payload:{int(stats.get('residual_payload_bytes', 0))}",
                         f"outlier_payload:{int(stats.get('outlier_payload_bytes', 0))}",
                     ]
@@ -1463,7 +1483,7 @@ class Codebook:
     def _rotated_blocks(self, state: dict[str, object], weight: Tensor) -> Tensor:
         blocks = self._blockified_weight(weight, int(state["block_dim"]))
         sign_vec = state["sign_vec"].to(device=blocks.device, dtype=blocks.dtype)
-        return hadamard_rotate_blocks(blocks, sign_vec)
+        return hadamard_rotate_blocks(blocks, sign_vec, enabled=self.h.codebook_use_hadamard)
 
     def _decode_fixed_blocks(self, state: dict[str, object], *, device: torch.device, dtype: torch.dtype) -> Tensor:
         return _decode_e8p_blocks(
@@ -1497,9 +1517,12 @@ class Codebook:
         dtype: torch.dtype,
     ) -> tuple[Tensor, Tensor, Tensor]:
         fixed_blocks = self._decode_fixed_blocks(state, device=device, dtype=dtype)
-        residual_codebook = state["residual_codebook"].to(device=device, dtype=dtype)
-        residual_idx = state["residual_idx"].to(device=device)
-        residual_blocks = codebook_lookup(residual_idx, residual_codebook)
+        if self.h.codebook_use_residual:
+            residual_codebook = state["residual_codebook"].to(device=device, dtype=dtype)
+            residual_idx = state["residual_idx"].to(device=device)
+            residual_blocks = codebook_lookup(residual_idx, residual_codebook)
+        else:
+            residual_blocks = torch.zeros_like(fixed_blocks)
         scales = self._scales(state, device=device, dtype=dtype)
         fixed_rotated = fixed_blocks * scales
         residual_rotated = (fixed_blocks + residual_blocks) * scales
@@ -1509,7 +1532,7 @@ class Codebook:
     def _reconstructed_weight(self, state: dict[str, object], device: torch.device, dtype: torch.dtype) -> Tensor:
         _, _, rotated_blocks = self._reconstructed_stage_blocks(state, device=device, dtype=torch.float32)
         sign_vec = state["sign_vec"].to(device=device, dtype=rotated_blocks.dtype)
-        blocks = hadamard_unrotate_blocks(rotated_blocks, sign_vec)
+        blocks = hadamard_unrotate_blocks(rotated_blocks, sign_vec, enabled=self.h.codebook_use_hadamard)
         return _unblockify_weight(blocks, tuple(state["shape"])).to(dtype=dtype)
 
     @staticmethod
@@ -1565,16 +1588,17 @@ class Codebook:
         block_dim = int(state["block_dim"])
         num_positions = int(state["num_positions"])
         sign_vec = state["sign_vec"].to(device=device, dtype=torch.float32)
-        unrotate = hadamard_unrotate_blocks(torch.eye(block_dim, device=device, dtype=torch.float32), sign_vec)
-        metrics = torch.empty(num_positions, block_dim, block_dim, device=device, dtype=torch.float32)
-        for pos in range(num_positions):
-            start = pos * block_dim
-            stop = start + block_dim
-            block_hessian = hessian_work[start:stop, start:stop]
-            block_metric = unrotate @ block_hessian @ unrotate.t()
-            block_metric = 0.5 * (block_metric + block_metric.t())
-            block_metric.diagonal().add_(1e-6)
-            metrics[pos] = block_metric
+        unrotate = hadamard_unrotate_blocks(
+            torch.eye(block_dim, device=device, dtype=torch.float32),
+            sign_vec,
+            enabled=self.h.codebook_use_hadamard,
+        )
+        reshaped = hessian_work.view(num_positions, block_dim, num_positions, block_dim)
+        block_indices = torch.arange(num_positions, device=device)
+        block_hessian = reshaped[block_indices, :, block_indices, :]
+        metrics = torch.matmul(unrotate.unsqueeze(0), torch.matmul(block_hessian, unrotate.t().unsqueeze(0)))
+        metrics = 0.5 * (metrics + metrics.transpose(-1, -2))
+        metrics.diagonal(dim1=-2, dim2=-1).add_(1e-6)
         return metrics
 
     def _metric_point_weights(self, metrics: Tensor, num_rows: int) -> Tensor:
@@ -1611,35 +1635,36 @@ class Codebook:
         residual_codebook: Tensor,
         metrics: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        rows, num_positions, block_dim = normalized_blocks.shape
-        residual_idx = torch.empty(rows, num_positions, device=normalized_blocks.device, dtype=torch.long)
-        residual_vals = torch.empty(rows, num_positions, block_dim, device=normalized_blocks.device, dtype=torch.float32)
-        scales = torch.empty(rows, num_positions, device=normalized_blocks.device, dtype=torch.float32)
         topk = min(self.h.codebook_ldlq_topk, residual_codebook.shape[0])
-        for pos in range(num_positions):
-            metric = metrics[pos]
-            target_norm = normalized_blocks[:, pos, :] - fixed_blocks[:, pos, :]
-            topk_idx = self._metric_topk_codewords(target_norm, residual_codebook, metric, topk=topk)
-            candidates = residual_codebook[topk_idx]
-            base = fixed_blocks[:, pos, :].unsqueeze(1) + candidates
-            target_rot = rotated_blocks[:, pos, :]
-            target_metric = target_rot @ metric
-            base_metric = torch.einsum("nkd,df->nkf", base, metric)
-            numer = (target_metric.unsqueeze(1) * base).sum(dim=-1)
-            denom = (base_metric * base).sum(dim=-1).clamp_min(1e-8)
-            candidate_scales = (numer / denom).clamp_min(1e-8)
-            errors = (
-                target_metric.unsqueeze(1) * target_rot.unsqueeze(1)
-            ).sum(dim=-1) - 2.0 * candidate_scales * numer + candidate_scales.square() * denom
-            best = errors.argmin(dim=-1)
-            best_idx = topk_idx.gather(1, best.unsqueeze(-1)).squeeze(-1)
-            best_vals = residual_codebook[best_idx]
-            best_base = fixed_blocks[:, pos, :] + best_vals
-            best_numer = ((target_rot @ metric) * best_base).sum(dim=-1)
-            best_denom = ((best_base @ metric) * best_base).sum(dim=-1).clamp_min(1e-8)
-            residual_idx[:, pos] = best_idx
-            residual_vals[:, pos, :] = best_vals
-            scales[:, pos] = (best_numer / best_denom).clamp_min(1e-8)
+        target_norm = normalized_blocks - fixed_blocks
+        target_norm_metric = torch.einsum("npd,pde->npe", target_norm, metrics)
+        codebook_metric = torch.einsum("kd,pde->pke", residual_codebook, metrics)
+        dists = (
+            (target_norm_metric * target_norm).sum(dim=-1, keepdim=True)
+            - 2.0 * torch.matmul(target_norm_metric, residual_codebook.t())
+            + (codebook_metric * residual_codebook.unsqueeze(0)).sum(dim=-1).unsqueeze(0)
+        )
+        topk_idx = torch.topk(dists, k=topk, largest=False, dim=-1).indices
+        block_dim = normalized_blocks.shape[-1]
+        candidates = residual_codebook[topk_idx]
+        base = fixed_blocks.unsqueeze(2) + candidates
+        target_metric = torch.einsum("npd,pde->npe", rotated_blocks, metrics)
+        base_metric = torch.einsum("nptd,pde->npte", base, metrics)
+        numer = (target_metric.unsqueeze(2) * base).sum(dim=-1)
+        denom = (base_metric * base).sum(dim=-1).clamp_min(1e-8)
+        candidate_scales = (numer / denom).clamp_min(1e-8)
+        target_quad = (target_metric * rotated_blocks).sum(dim=-1, keepdim=True)
+        errors = target_quad - 2.0 * candidate_scales * numer + candidate_scales.square() * denom
+        best = errors.argmin(dim=-1)
+        gather_idx = best.unsqueeze(-1)
+        residual_idx = topk_idx.gather(2, gather_idx).squeeze(-1)
+        residual_vals = candidates.gather(
+            2,
+            gather_idx.unsqueeze(-1).expand(-1, -1, 1, block_dim),
+        ).squeeze(2)
+        best_numer = numer.gather(2, gather_idx).squeeze(-1)
+        best_denom = denom.gather(2, gather_idx).squeeze(-1)
+        scales = (best_numer / best_denom).clamp_min(1e-8)
         return residual_idx, residual_vals, scales.unsqueeze(-1)
 
     @torch.no_grad()
@@ -1652,27 +1677,17 @@ class Codebook:
     ) -> Tensor:
         k, block_dim = prev_codebook.shape
         eye = torch.eye(block_dim, device=targets.device, dtype=torch.float32)
-        system = eye.unsqueeze(0).repeat(k, 1, 1) * 1e-6
-        rhs = torch.zeros(k, block_dim, device=targets.device, dtype=torch.float32)
-        counts = torch.zeros(k, device=targets.device, dtype=torch.long)
-        num_positions = targets.shape[1]
-        for pos in range(num_positions):
-            metric = metrics[pos]
-            target = targets[:, pos, :]
-            assigned = assignments[:, pos]
-            for code in range(k):
-                mask = assigned == code
-                if not mask.any():
-                    continue
-                chosen = target[mask]
-                counts[code] += chosen.shape[0]
-                system[code] += metric * float(chosen.shape[0])
-                rhs[code] += (metric @ chosen.t()).sum(dim=1)
+        one_hot = F.one_hot(assignments.long(), num_classes=k).to(dtype=torch.float32)
+        counts_by_pos = one_hot.sum(dim=0)
+        counts = counts_by_pos.sum(dim=0)
+        system = torch.einsum("pk,pde->kde", counts_by_pos, metrics)
+        system = system + eye.unsqueeze(0) * 1e-6
+        metric_targets = torch.einsum("npd,pde->npe", targets, metrics)
+        rhs = torch.einsum("npk,npe->ke", one_hot, metric_targets)
         updated = prev_codebook.to(device=targets.device, dtype=torch.float32).clone()
-        for code in range(k):
-            if int(counts[code].item()) == 0:
-                continue
-            updated[code] = torch.linalg.solve(system[code], rhs[code])
+        mask = counts > 0
+        if mask.any():
+            updated[mask] = torch.linalg.solve(system[mask], rhs[mask])
         return updated
 
     @torch.no_grad()
@@ -1729,12 +1744,7 @@ class Codebook:
 
     @staticmethod
     def _metric_scores(diff_blocks: Tensor, metrics: Tensor) -> Tensor:
-        scores = torch.empty(diff_blocks.shape[:2], device=diff_blocks.device, dtype=torch.float32)
-        for pos in range(diff_blocks.shape[1]):
-            metric = metrics[pos]
-            diff = diff_blocks[:, pos, :]
-            scores[:, pos] = ((diff @ metric) * diff).sum(dim=-1)
-        return scores
+        return torch.einsum("npd,pde,npe->np", diff_blocks, metrics, diff_blocks)
 
     @torch.no_grad()
     def _select_outliers(
@@ -1744,6 +1754,11 @@ class Codebook:
         residual_rotated: Tensor,
         metrics: Tensor,
     ) -> None:
+        if not self.h.codebook_use_outliers:
+            state["outlier_positions"] = torch.empty((0,), dtype=torch.long, device=rotated_blocks.device)
+            state["outlier_q"] = torch.empty((0, int(state["block_dim"])), dtype=torch.int8, device=rotated_blocks.device)
+            state["outlier_scale"] = torch.empty((0,), dtype=INT8_PER_ROW_SCALE_DTYPE, device=rotated_blocks.device)
+            return
         num_blocks = int(state["num_rows"]) * int(state["num_positions"])
         outlier_count = min(
             self.h.codebook_outlier_max_blocks,
@@ -1798,15 +1813,24 @@ class Codebook:
         residual_rel_mse = residual_mse / energy
         final_rel_mse = final_mse / energy
         scales = self._scales(state, device=rotated_blocks.device, dtype=torch.float32)
-        counts_residual = torch.bincount(state["residual_idx"].to(device=rotated_blocks.device), minlength=self.h.codebook_residual_k).to(torch.float32)
+        if self.h.codebook_use_residual:
+            counts_residual = torch.bincount(
+                state["residual_idx"].to(device=rotated_blocks.device),
+                minlength=self.h.codebook_residual_k,
+            ).to(torch.float32)
+            used_residual = int((counts_residual > 0).sum().item())
+        else:
+            counts_residual = torch.zeros(self.h.codebook_residual_k, device=rotated_blocks.device, dtype=torch.float32)
+            used_residual = 0
         num_blocks = int(state["fixed_idx"].numel())
         fixed_raw_bits = _hybrid_fixed_raw_bits(num_blocks)
+        scale_raw_bits = _hybrid_scale_raw_bits(num_blocks, self.h)
         residual_raw_bits = _hybrid_residual_raw_bits(num_blocks, self.h)
         outlier_raw_bits = self._outlier_raw_bits(state)
         return {
             "num_weights": int(weight.numel()),
             "num_blocks": num_blocks,
-            "raw_bits": int(fixed_raw_bits + residual_raw_bits + outlier_raw_bits),
+            "raw_bits": int(fixed_raw_bits + scale_raw_bits + residual_raw_bits + outlier_raw_bits),
             "fixed_mse": float(fixed_mse.item()),
             "fixed_rmse": float(fixed_mse.sqrt().item()),
             "fixed_rel_mse": float(fixed_rel_mse.item()),
@@ -1821,10 +1845,12 @@ class Codebook:
             "scale_min": float(scales.min().item()),
             "scale_max": float(scales.max().item()),
             "scale_mean": float(scales.mean().item()),
-            "used_residual": int((counts_residual > 0).sum().item()),
+            "used_residual": used_residual,
             "outlier_blocks": int(state["outlier_positions"].numel()),
             "fixed_raw_bits": fixed_raw_bits,
             "fixed_raw_bpw": fixed_raw_bits / max(float(weight.numel()), 1.0),
+            "scale_raw_bits": scale_raw_bits,
+            "scale_raw_bpw": scale_raw_bits / max(float(weight.numel()), 1.0),
             "residual_raw_bits": residual_raw_bits,
             "residual_raw_bpw": residual_raw_bits / max(float(weight.numel()), 1.0),
             "outlier_raw_bits": outlier_raw_bits,
@@ -1852,10 +1878,11 @@ class Codebook:
         state["log_scales"].copy_(
             initial_scales.reshape(-1, 1).log().to(device=state["log_scales"].device, dtype=state["log_scales"].dtype)
         )
-        residual_seed = normalized_blocks - fixed_blocks
-        self._initialize_residual_codebook(state, residual_seed, metrics)
+        if self.h.codebook_use_residual:
+            residual_seed = normalized_blocks - fixed_blocks
+            self._initialize_residual_codebook(state, residual_seed, metrics)
 
-        for _ in range(max(self.h.codebook_refinement_iters, 1)):
+        for _ in range(max(self.h.codebook_refinement_iters, 1) if self.h.codebook_use_residual else 0):
             residual_codebook = state["residual_codebook"].to(device=rotated_blocks.device, dtype=torch.float32)
             fixed_idx, fixed_blocks, residual_idx, residual_vals, scales = self._local_assign_blocks(
                 state,
@@ -1876,6 +1903,8 @@ class Codebook:
             )
             initial_scales = scales
 
+        if not self.h.codebook_use_residual:
+            state["residual_codebook"].zero_()
         residual_codebook = state["residual_codebook"].to(device=rotated_blocks.device, dtype=torch.float32)
         fixed_idx, fixed_blocks, residual_idx, residual_vals, scales = self._local_assign_blocks(
             state,
@@ -1885,7 +1914,11 @@ class Codebook:
             initial_scales,
         )
         state["fixed_idx"].copy_(fixed_idx.reshape(-1).to(device=state["fixed_idx"].device))
-        state["residual_idx"].copy_(residual_idx.reshape(-1).to(device=state["residual_idx"].device))
+        if self.h.codebook_use_residual:
+            state["residual_idx"].copy_(residual_idx.reshape(-1).to(device=state["residual_idx"].device))
+        else:
+            state["residual_idx"].zero_()
+            residual_vals = torch.zeros_like(fixed_blocks)
         state["log_scales"].copy_(
             scales.reshape(-1, 1).log().to(device=state["log_scales"].device, dtype=state["log_scales"].dtype)
         )
@@ -1921,7 +1954,8 @@ class Codebook:
             log(
                 f"codebook:fit target_tensors:{len(self.target_modules)} target_weights:{target_weights} "
                 f"coverage:{coverage:.4%} calibration_batches:{self.h.codebook_calibration_batches} "
-                f"hadamard_backend:{HADAMARD_BACKEND} lattice:e8p12"
+                f"hadamard:{self.h.codebook_use_hadamard} residual:{self.h.codebook_use_residual} "
+                f"outliers:{self.h.codebook_use_outliers} hadamard_backend:{HADAMARD_BACKEND} lattice:e8p12"
             )
         missing = [name for name, _ in self.target_modules if name not in hessians]
         if missing and self.h.is_main_process:
@@ -1933,6 +1967,7 @@ class Codebook:
         weighted_rel_mse = sum(float(stats["rel_mse"]) * int(stats["num_weights"]) for _, stats in fitted_items)
         total_raw_bits = sum(int(stats["raw_bits"]) for _, stats in fitted_items)
         total_fixed_raw_bits = sum(int(stats["fixed_raw_bits"]) for _, stats in fitted_items)
+        total_scale_raw_bits = sum(int(stats["scale_raw_bits"]) for _, stats in fitted_items)
         total_residual_raw_bits = sum(int(stats["residual_raw_bits"]) for _, stats in fitted_items)
         total_outlier_raw_bits = sum(int(stats["outlier_raw_bits"]) for _, stats in fitted_items)
         total_outlier_blocks = sum(int(stats["outlier_blocks"]) for _, stats in fitted_items)
@@ -1944,6 +1979,7 @@ class Codebook:
                 f"final_rel_mse:{weighted_rel_mse / max(total_target_weights, 1):.6e} "
                 f"target_raw_bpw:{total_raw_bits / max(total_target_weights, 1):.4f} "
                 f"fixed_raw_bpw:{total_fixed_raw_bits / max(total_target_weights, 1):.4f} "
+                f"scale_raw_bpw:{total_scale_raw_bits / max(total_target_weights, 1):.4f} "
                 f"residual_raw_bpw:{total_residual_raw_bits / max(total_target_weights, 1):.4f} "
                 f"outlier_raw_bpw:{total_outlier_raw_bits / max(total_target_weights, 1):.4f} "
                 f"outlier_frac:{total_outlier_blocks / max(total_blocks, 1):.4%}"
@@ -1962,6 +1998,7 @@ class Codebook:
         total_target_weights = 0
         total_payload_bytes = 0
         fixed_payload_bytes = 0
+        scale_payload_bytes = 0
         residual_payload_bytes = 0
         outlier_payload_bytes = 0
         int8_fallback_payload_bytes = 0
@@ -1983,15 +2020,16 @@ class Codebook:
                 scales_cpu = self._scales(state, device=torch.device("cpu"), dtype=torch.float32)
                 scale_codes, scale_meta = quantize_log_scales(scales_cpu, self.h.codebook_scale_bits)
                 packed_fixed_idx = _pack_codes(fixed_idx_cpu, 16).cpu().contiguous()
-                packed_residual_idx = _pack_codes(
-                    residual_idx_cpu,
-                    _bits_for_size(self.h.codebook_residual_k),
-                ).cpu().contiguous()
                 packed_scales = _pack_codes(scale_codes, self.h.codebook_scale_bits).cpu().contiguous()
                 result[name + ".fi"] = packed_fixed_idx
-                result[name + ".rc"] = residual_codebook_cpu
-                result[name + ".ri"] = packed_residual_idx
                 result[name + ".s"] = packed_scales
+                if self.h.codebook_use_residual:
+                    packed_residual_idx = _pack_codes(
+                        residual_idx_cpu,
+                        _bits_for_size(self.h.codebook_residual_k),
+                    ).cpu().contiguous()
+                    result[name + ".rc"] = residual_codebook_cpu
+                    result[name + ".ri"] = packed_residual_idx
 
                 outlier_count = int(state["outlier_positions"].numel())
                 outlier_position_bits = _bits_for_size(int(state["fixed_idx"].numel()))
@@ -2007,11 +2045,14 @@ class Codebook:
                     "fixed_bits": 16,
                     "fixed_codebook": "E8P12",
                     "lattice_scale": float(self.h.codebook_lattice_scale),
-                    "residual_k": self.h.codebook_residual_k,
-                    "residual_bits": _bits_for_size(self.h.codebook_residual_k),
+                    "hadamard": bool(self.h.codebook_use_hadamard),
+                    "residual_enabled": bool(self.h.codebook_use_residual),
+                    "residual_k": self.h.codebook_residual_k if self.h.codebook_use_residual else 0,
+                    "residual_bits": _bits_for_size(self.h.codebook_residual_k) if self.h.codebook_use_residual else 0,
                     "scale_bits": self.h.codebook_scale_bits,
                     "scale_log_min": scale_meta["log_min"],
                     "scale_log_max": scale_meta["log_max"],
+                    "outlier_enabled": bool(self.h.codebook_use_outliers),
                     "outlier_count": outlier_count,
                     "outlier_position_bits": outlier_position_bits,
                 }
@@ -2030,7 +2071,10 @@ class Codebook:
                     device=torch.device("cpu"),
                     dtype=torch.float32,
                 )
-                residual_blocks_cpu = codebook_lookup(residual_idx_cpu, residual_codebook_cpu.float())
+                if self.h.codebook_use_residual:
+                    residual_blocks_cpu = codebook_lookup(residual_idx_cpu, residual_codebook_cpu.float())
+                else:
+                    residual_blocks_cpu = torch.zeros_like(fixed_blocks_cpu)
                 fixed_rotated = fixed_blocks_cpu * quantized_scales
                 residual_rotated = (fixed_blocks_cpu + residual_blocks_cpu) * quantized_scales
                 final_rotated = residual_rotated.clone()
@@ -2051,21 +2095,26 @@ class Codebook:
                 final_mse = float(final_diff.square().mean().item())
                 final_rel_mse = final_mse / max(float(target_rotated.square().mean().item()), 1e-12)
 
-                payload_keys = [name + ".fi", name + ".rc", name + ".ri", name + ".s"]
+                payload_keys = [name + ".fi", name + ".s"]
+                if self.h.codebook_use_residual:
+                    payload_keys.extend([name + ".rc", name + ".ri"])
                 if outlier_count > 0:
                     payload_keys.extend([name + ".op", name + ".oq", name + ".os"])
                 payload_bytes = sum(result[key].numel() * result[key].element_size() for key in payload_keys)
                 fixed_bytes = result[name + ".fi"].numel() * result[name + ".fi"].element_size()
-                residual_bytes = (
-                    result[name + ".rc"].numel() * result[name + ".rc"].element_size()
-                    + result[name + ".ri"].numel() * result[name + ".ri"].element_size()
-                    + result[name + ".s"].numel() * result[name + ".s"].element_size()
-                )
+                scale_bytes = result[name + ".s"].numel() * result[name + ".s"].element_size()
+                residual_bytes = 0
+                if self.h.codebook_use_residual:
+                    residual_bytes = (
+                        result[name + ".rc"].numel() * result[name + ".rc"].element_size()
+                        + result[name + ".ri"].numel() * result[name + ".ri"].element_size()
+                    )
                 outlier_bytes = 0
                 if outlier_count > 0:
                     outlier_bytes = sum(result[key].numel() * result[key].element_size() for key in (name + ".op", name + ".oq", name + ".os"))
                 total_payload_bytes += payload_bytes
                 fixed_payload_bytes += fixed_bytes
+                scale_payload_bytes += scale_bytes
                 residual_payload_bytes += residual_bytes
                 outlier_payload_bytes += outlier_bytes
                 state_export_stats = dict(state["stats"])
@@ -2080,6 +2129,7 @@ class Codebook:
                         "rel_mse": final_rel_mse,
                         "payload_bytes": payload_bytes,
                         "fixed_payload_bytes": fixed_bytes,
+                        "scale_payload_bytes": scale_bytes,
                         "residual_payload_bytes": residual_bytes,
                         "outlier_payload_bytes": outlier_bytes,
                         "raw_bpw": float(self._state_raw_bits(state)) / max(float(state["fixed_idx"].numel() * int(state["block_dim"])), 1.0),
@@ -2130,6 +2180,7 @@ class Codebook:
             "model_fp_weights": total_fp_weights,
             "coverage": total_target_weights / max(total_fp_weights, 1),
             "fixed_payload_bytes": fixed_payload_bytes,
+            "scale_payload_bytes": scale_payload_bytes,
             "residual_payload_bytes": residual_payload_bytes,
             "outlier_payload_bytes": outlier_payload_bytes,
             "int8_fallback_payload_bytes": int8_fallback_payload_bytes,
@@ -2186,8 +2237,6 @@ def dequantize_state_dict_codebook(
         block_dim = int(info["block_dim"])
         num_blocks = math.prod(shape) // block_dim
         fixed_idx = _unpack_codes(result[name + ".fi"], int(info["fixed_bits"]), num_blocks)
-        residual_codebook = result[name + ".rc"].to(dtype=torch.float32)
-        residual_idx = _unpack_codes(result[name + ".ri"], int(info["residual_bits"]), num_blocks)
         scale_codes = _unpack_codes(result[name + ".s"], int(info["scale_bits"]), num_blocks)
         scales = dequantize_log_scales(
             scale_codes,
@@ -2203,7 +2252,12 @@ def dequantize_state_dict_codebook(
             device=torch.device("cpu"),
             dtype=torch.float32,
         )
-        residual_blocks = codebook_lookup(residual_idx, residual_codebook)
+        if bool(info.get("residual_enabled", True)):
+            residual_codebook = result[name + ".rc"].to(dtype=torch.float32)
+            residual_idx = _unpack_codes(result[name + ".ri"], int(info["residual_bits"]), num_blocks)
+            residual_blocks = codebook_lookup(residual_idx, residual_codebook)
+        else:
+            residual_blocks = torch.zeros_like(fixed_blocks)
         rotated_blocks = (fixed_blocks + residual_blocks) * scales
         outlier_count = int(info.get("outlier_count", 0))
         if outlier_count > 0:
@@ -2216,7 +2270,11 @@ def dequantize_state_dict_codebook(
             )
             rotated_blocks.index_add_(0, positions.long(), delta)
         sign_vec = _hadamard_sign_vector(name, block_dim, device=torch.device("cpu"), dtype=rotated_blocks.dtype)
-        blocks = hadamard_unrotate_blocks(rotated_blocks, sign_vec)
+        blocks = hadamard_unrotate_blocks(
+            rotated_blocks,
+            sign_vec,
+            enabled=bool(info.get("hadamard", True)),
+        )
         out[name] = _unblockify_weight(blocks, shape).to(orig.dtype)
     return out
 
@@ -2335,6 +2393,7 @@ def serialize(
         )
         log(
             f"Codebook payload breakdown fixed_bytes:{summary.get('fixed_payload_bytes', 0)} "
+            f"scale_bytes:{summary.get('scale_payload_bytes', 0)} "
             f"residual_bytes:{summary.get('residual_payload_bytes', 0)} "
             f"outlier_bytes:{summary.get('outlier_payload_bytes', 0)} "
             f"int8_fallback_bytes:{summary.get('int8_fallback_payload_bytes', 0)} "
