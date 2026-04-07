@@ -12,3 +12,4 @@ psutil
 packaging
 ninja
 brotli
+wheel
