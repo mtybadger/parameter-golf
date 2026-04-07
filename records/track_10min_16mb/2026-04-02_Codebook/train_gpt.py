@@ -1,3 +1,9 @@
+"""
+07/04 - My best attempt so far at getting competitive results with VQ codebook quantization.
+Based on PR #1218
+"""
+
+
 import copy
 import glob
 import io
@@ -108,27 +114,11 @@ class Hyperparameters():
     codebook_hessian_damp = float(os.environ.get("CODEBOOK_HESSIAN_DAMP", 0.01))
     codebook_lattice_scale = float(os.environ.get("CODEBOOK_LATTICE_SCALE", 1.03))
     codebook_scale_bits = int(os.environ.get("CODEBOOK_SCALE_BITS", 8))
-    codebook_assignment_entropy_weight = float(os.environ.get("CODEBOOK_ASSIGNMENT_ENTROPY_WEIGHT", 0.01))
-    codebook_soft_snap_enabled = bool(int(os.environ.get("CODEBOOK_SOFT_SNAP_ENABLED", "0")))
-    codebook_soft_snap_start_frac = float(os.environ.get("CODEBOOK_SOFT_SNAP_START_FRAC", 0.9))
-    codebook_soft_snap_alpha = float(os.environ.get("CODEBOOK_SOFT_SNAP_ALPHA", 0.02))
-    codebook_soft_snap_update_every = int(os.environ.get("CODEBOOK_SOFT_SNAP_UPDATE_EVERY", 1))
-    codebook_penalty_enabled = bool(
-        int(os.environ.get("CODEBOOK_PENALTY_ENABLED", os.environ.get("CODEBOOK_STALE_PENALTY_ENABLED", "0")))
-    )
-    codebook_penalty_start_frac = float(
-        os.environ.get("CODEBOOK_PENALTY_START_FRAC", os.environ.get("CODEBOOK_STALE_PENALTY_START_FRAC", 0.75))
-    )
-    codebook_penalty_weight = float(
-        os.environ.get("CODEBOOK_PENALTY_WEIGHT", os.environ.get("CODEBOOK_STALE_PENALTY_WEIGHT", 0.01))
-    )
-    codebook_penalty_refresh_every = int(
-        os.environ.get("CODEBOOK_PENALTY_REFRESH_EVERY", os.environ.get("CODEBOOK_STALE_PENALTY_REFRESH_EVERY", 16))
-    )
-    codebook_outlier_frac = float(os.environ.get("CODEBOOK_OUTLIER_FRAC", 0.0))
+    codebook_penalty_enabled = bool(int(os.environ.get("CODEBOOK_PENALTY_ENABLED", "0")))
+    codebook_penalty_start_frac = float(os.environ.get("CODEBOOK_PENALTY_START_FRAC", 0.9))
+    codebook_penalty_weight = float(os.environ.get("CODEBOOK_PENALTY_WEIGHT", 0.0))
+    codebook_penalty_refresh_every = int(os.environ.get("CODEBOOK_PENALTY_REFRESH_EVERY", 64))
     codebook_outlier_max_count = int(os.environ.get("CODEBOOK_OUTLIER_MAX_COUNT", 0))
-    codebook_entropy_summary_topk = int(os.environ.get("CODEBOOK_ENTROPY_SUMMARY_TOPK", 12))
-    codebook_entropy_focus = os.environ.get("CODEBOOK_ENTROPY_FOCUS", "").strip()
 
     # Distributed setup
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
@@ -879,6 +869,11 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+CODEBOOK_CANDIDATE_BATCH_SIZE = 4096
+CODEBOOK_POSITION_BATCH_SIZE = 8
+
+# The idea here is to use the codebook for the heavy weights
+
 CODEBOOK_TARGET_PATTERNS = (
     "attn.c_q.weight",
     "attn.c_k.weight",
@@ -951,20 +946,6 @@ def _validate_codebook_hparams(h: Hyperparameters) -> None:
         raise ValueError(f"CODEBOOK_LATTICE_SCALE must be positive, got {h.codebook_lattice_scale}")
     if h.codebook_scale_bits <= 0 or h.codebook_scale_bits > 16:
         raise ValueError(f"CODEBOOK_SCALE_BITS must be in [1, 16], got {h.codebook_scale_bits}")
-    if h.codebook_assignment_entropy_weight < 0:
-        raise ValueError(
-            f"CODEBOOK_ASSIGNMENT_ENTROPY_WEIGHT must be non-negative, got {h.codebook_assignment_entropy_weight}"
-        )
-    if not 0.0 <= h.codebook_soft_snap_start_frac <= 1.0:
-        raise ValueError(
-            f"CODEBOOK_SOFT_SNAP_START_FRAC must be in [0, 1], got {h.codebook_soft_snap_start_frac}"
-        )
-    if not 0.0 <= h.codebook_soft_snap_alpha <= 1.0:
-        raise ValueError(f"CODEBOOK_SOFT_SNAP_ALPHA must be in [0, 1], got {h.codebook_soft_snap_alpha}")
-    if h.codebook_soft_snap_update_every <= 0:
-        raise ValueError(
-            f"CODEBOOK_SOFT_SNAP_UPDATE_EVERY must be positive, got {h.codebook_soft_snap_update_every}"
-        )
     if not 0.0 <= h.codebook_penalty_start_frac <= 1.0:
         raise ValueError(
             f"CODEBOOK_PENALTY_START_FRAC must be in [0, 1], got {h.codebook_penalty_start_frac}"
@@ -977,8 +958,6 @@ def _validate_codebook_hparams(h: Hyperparameters) -> None:
         raise ValueError(
             f"CODEBOOK_PENALTY_REFRESH_EVERY must be positive, got {h.codebook_penalty_refresh_every}"
         )
-    if not 0.0 <= h.codebook_outlier_frac <= 1.0:
-        raise ValueError(f"CODEBOOK_OUTLIER_FRAC must be in [0, 1], got {h.codebook_outlier_frac}")
     if h.codebook_outlier_max_count < 0:
         raise ValueError(f"CODEBOOK_OUTLIER_MAX_COUNT must be non-negative, got {h.codebook_outlier_max_count}")
 
@@ -1005,6 +984,22 @@ def _should_codebook_quantize(name: str, t: Tensor, h: Hyperparameters) -> bool:
         and name.startswith("blocks.")
         and any(name.endswith(pattern) for pattern in CODEBOOK_TARGET_PATTERNS)
     )
+
+
+def _codebook_target_modules(model: nn.Module, h: Hyperparameters) -> list[tuple[str, CastedLinear]]:
+    targets: list[tuple[str, CastedLinear]] = []
+    for module_name, module in model.named_modules():
+        if not isinstance(module, CastedLinear):
+            continue
+        weight_name = f"{module_name}.weight"
+        if _should_codebook_quantize(weight_name, module.weight, h):
+            targets.append((weight_name, module))
+    return targets
+
+# This Hadamard thing was taken from QuIP; it's not entirely clear if it works well for us
+# It seems to contribute a small amount of BPB. Unsure why the paper talked it up so much.
+
+
 def _hadamard_sign_vector(name: str, block_dim: int, *, device: torch.device, dtype: torch.dtype) -> Tensor:
     rng = random.Random(f"hadamard::{name}::{block_dim}")
     return torch.tensor(
@@ -1043,6 +1038,7 @@ def hadamard_unrotate_blocks(blocks: Tensor, sign_vec: Tensor, *, enabled: bool 
         return blocks
     return hadamard_transform(blocks, scale=blocks.shape[-1] ** -0.5) * sign_vec
 
+# Defining our fixed codebook
 
 def get_norm12() -> Tensor:
     return torch.tensor([
@@ -1129,6 +1125,10 @@ def get_full_grid(packed_abs_grid: Tensor) -> tuple[Tensor, Tensor]:
 
 _E8P_PACKED_ABS = get_packed_abs_grid()
 _E8P_GRID, _E8P_PARITY_IDX = get_full_grid(_E8P_PACKED_ABS)
+
+# ----------------------------------------
+# Codebook
+# ----------------------------------------
 
 
 class E8P12Codebook(nn.Module):
@@ -1283,18 +1283,7 @@ def _fast_quantize_weight_target(h: Hyperparameters, name: str, weight: Tensor) 
     )
     return _unblockify_weight(recon_blocks, shape).to(dtype=weight.dtype)
 
-
-def _log_prior_from_assignments(
-    assignments: Tensor,
-    num_entries: int,
-    *,
-    smoothing: float = 1.0,
-) -> Tensor:
-    flat = assignments.reshape(-1).to(dtype=torch.int64)
-    counts = torch.bincount(flat, minlength=num_entries).to(dtype=torch.float32)
-    probs = (counts + float(smoothing)) / float(counts.sum().item() + smoothing * num_entries)
-    return torch.log(probs)
-
+# Seems to be really helpful to pick codewords based on Hessian-derived metrics
 
 @torch.no_grad()
 def _metric_optimal_codewords(
@@ -1302,9 +1291,8 @@ def _metric_optimal_codewords(
     metrics: Tensor,
     candidates: Tensor,
     *,
-    candidate_batch_size: int = 4096,
-    assignment_log_prior: Tensor | None = None,
-    assignment_entropy_weight: float = 0.0,
+    candidate_batch_size: int = CODEBOOK_CANDIDATE_BATCH_SIZE,
+    position_batch_size: int = CODEBOOK_POSITION_BATCH_SIZE,
 ) -> tuple[Tensor, Tensor]:
     if rotated_blocks.ndim != 3:
         raise ValueError(f"Expected rotated blocks with shape [rows, positions, dim], got {tuple(rotated_blocks.shape)}")
@@ -1313,40 +1301,36 @@ def _metric_optimal_codewords(
         raise ValueError(f"Expected metrics with shape {expected_metrics_shape}, got {tuple(metrics.shape)}")
     if candidates.ndim != 2 or candidates.shape[1] != rotated_blocks.shape[2]:
         raise ValueError(f"Expected candidates [entries, {rotated_blocks.shape[2]}], got {tuple(candidates.shape)}")
-    if assignment_log_prior is not None and assignment_log_prior.shape != (candidates.shape[0],):
-        raise ValueError(
-            f"Expected assignment_log_prior with shape ({candidates.shape[0]},), got {tuple(assignment_log_prior.shape)}"
-        )
     num_rows, num_positions, _ = rotated_blocks.shape
     selected_idx = torch.empty((num_rows, num_positions), device=rotated_blocks.device, dtype=torch.long)
     selected_codewords = torch.empty_like(rotated_blocks, dtype=torch.float32)
-    for pos in range(num_positions):
-        metric = metrics[pos]
-        x = rotated_blocks[:, pos, :].to(dtype=torch.float32)
-        x_metric = torch.matmul(x, metric)
-        best_improvement = torch.full((num_rows,), -torch.inf, device=x.device, dtype=torch.float32)
-        best_idx = torch.zeros((num_rows,), device=x.device, dtype=torch.long)
+    for pos_start in range(0, num_positions, position_batch_size):
+        pos_stop = min(pos_start + position_batch_size, num_positions)
+        metric = metrics[pos_start:pos_stop]
+        x = rotated_blocks[:, pos_start:pos_stop, :].to(dtype=torch.float32)
+        x_metric = torch.einsum("npd,pde->npe", x, metric)
+        best_improvement = torch.full((num_rows, pos_stop - pos_start), -torch.inf, device=x.device, dtype=torch.float32)
+        best_idx = torch.zeros((num_rows, pos_stop - pos_start), device=x.device, dtype=torch.long)
         for start in range(0, candidates.shape[0], candidate_batch_size):
             cand = candidates[start:start + candidate_batch_size]
-            cand_metric = torch.matmul(cand, metric)
-            numer = torch.matmul(x_metric, cand.t())
-            denom = (cand_metric * cand).sum(dim=-1).clamp_min(1e-8)
+            cand_metric = torch.einsum("cd,pde->pce", cand, metric)
+            numer = torch.einsum("npd,cd->npc", x_metric, cand)
+            denom = torch.einsum("pce,ce->pc", cand_metric, cand).clamp_min(1e-8)
             # x^T M x is candidate-independent, so minimizing the optimal metric error is
             # equivalent to maximizing the gain from the best non-negative scale.
             improvement = numer.clamp_min(0.0).square() / denom.unsqueeze(0)
-            if assignment_log_prior is not None and assignment_entropy_weight > 0:
-                improvement = improvement + float(assignment_entropy_weight) * assignment_log_prior[
-                    start:start + cand.shape[0]
-                ].unsqueeze(0)
-            chunk_best_improvement, chunk_best_idx = improvement.max(dim=1)
+            chunk_best_improvement, chunk_best_idx = improvement.max(dim=2)
             update = chunk_best_improvement > best_improvement
             if update.any():
                 best_improvement = torch.where(update, chunk_best_improvement, best_improvement)
                 best_idx = torch.where(update, start + chunk_best_idx, best_idx)
-        selected_idx[:, pos] = best_idx
-        selected_codewords[:, pos, :] = candidates.index_select(0, best_idx)
+        selected_idx[:, pos_start:pos_stop] = best_idx
+        selected_codewords[:, pos_start:pos_stop, :] = candidates.index_select(
+            0, best_idx.reshape(-1)
+        ).view(num_rows, pos_stop - pos_start, -1)
     return selected_codewords, selected_idx
 
+# Same as GPTQ
 
 def collect_hessians(
     model: nn.Module,
@@ -1464,9 +1448,8 @@ def _metric_optimal_e8p_codewords(
     metrics: Tensor,
     lattice_scale: float,
     *,
-    candidate_batch_size: int = 4096,
-    assignment_log_prior: Tensor | None = None,
-    assignment_entropy_weight: float = 0.0,
+    candidate_batch_size: int = CODEBOOK_CANDIDATE_BATCH_SIZE,
+    position_batch_size: int = CODEBOOK_POSITION_BATCH_SIZE,
 ) -> tuple[Tensor, Tensor]:
     codebook = _get_e8p_codebook(rotated_blocks.device)
     candidates = codebook.grid.to(dtype=torch.float32) / float(lattice_scale)
@@ -1475,153 +1458,58 @@ def _metric_optimal_e8p_codewords(
         metrics,
         candidates,
         candidate_batch_size=candidate_batch_size,
-        assignment_log_prior=assignment_log_prior,
-        assignment_entropy_weight=assignment_entropy_weight,
+        position_batch_size=position_batch_size,
     )
 
 
-class FixedCodebookSoftSnap:
+class CodebookPenalty:
     def __init__(self, h: Hyperparameters, model: nn.Module):
         _validate_codebook_hparams(h)
         self.h = h
-        self.target_modules: list[tuple[str, CastedLinear]] = []
-        self.target_weights = 0
-        self.active = False
-        self.last_snap_step: int | None = None
-        for module_name, module in model.named_modules():
-            if not isinstance(module, CastedLinear):
-                continue
-            weight_name = f"{module_name}.weight"
-            if _should_codebook_quantize(weight_name, module.weight, h):
-                self.target_modules.append((weight_name, module))
-                self.target_weights += int(module.weight.numel())
-
-    def should_activate(self, frac: float) -> bool:
-        return self.h.codebook_soft_snap_enabled and not self.active and frac >= self.h.codebook_soft_snap_start_frac
-
-    @torch.no_grad()
-    def apply(self, step: int, *, force: bool = False) -> bool:
-        if not self.active or not self.target_modules:
-            return False
-        if not force and self.last_snap_step is not None:
-            if (step - self.last_snap_step) < self.h.codebook_soft_snap_update_every:
-                return False
-        alpha = float(self.h.codebook_soft_snap_alpha)
-        if alpha <= 0.0:
-            return False
-        for name, module in self.target_modules:
-            q_weight = _fast_quantize_weight_target(self.h, name, module.weight)
-            module.weight.lerp_(q_weight, alpha)
-        self.last_snap_step = step
-        return True
-
-    def activate(self, step: int, frac: float) -> None:
-        if self.active:
-            return
-        self.active = True
-        if self.h.is_main_process:
-            log(
-                f"codebook_soft_snap:enabled step:{step}/{self.h.iterations} "
-                f"start_frac:{self.h.codebook_soft_snap_start_frac:.3f} frac:{frac:.3f} "
-                f"mode:fast_direction "
-                f"alpha:{self.h.codebook_soft_snap_alpha:.4f} "
-                f"target_tensors:{len(self.target_modules)} target_weights:{self.target_weights} "
-                f"update_every:{self.h.codebook_soft_snap_update_every}"
-            )
-
-
-class FixedCodebookPenalty:
-    def __init__(self, h: Hyperparameters, model: nn.Module):
-        _validate_codebook_hparams(h)
-        self.h = h
-        self.target_modules: list[tuple[str, CastedLinear]] = []
-        self.target_weights = 0
+        self.target_modules = _codebook_target_modules(model, h)
         self.active = False
         self.last_refresh_step: int | None = None
-        self.cached_targets: list[dict[str, object]] = []
-        for module_name, module in model.named_modules():
-            if not isinstance(module, CastedLinear):
-                continue
-            weight_name = f"{module_name}.weight"
-            if _should_codebook_quantize(weight_name, module.weight, h):
-                self.target_modules.append((weight_name, module))
-                self.target_weights += int(module.weight.numel())
+        self.cached_targets: list[tuple[CastedLinear, Tensor]] = []
 
     def should_activate(self, frac: float) -> bool:
         return self.h.codebook_penalty_enabled and not self.active and frac >= self.h.codebook_penalty_start_frac
 
-    def activate(self, step: int, frac: float) -> None:
-        if self.active:
-            return
+    def activate(self) -> None:
         self.active = True
-        if self.h.is_main_process:
-            log(
-                f"codebook_penalty:enabled step:{step}/{self.h.iterations} "
-                f"start_frac:{self.h.codebook_penalty_start_frac:.3f} frac:{frac:.3f} "
-                f"weight:{self.h.codebook_penalty_weight:.5f} "
-                f"mode:fast_direction_target "
-                f"refresh_every:{self.h.codebook_penalty_refresh_every} "
-                f"target_tensors:{len(self.target_modules)} target_weights:{self.target_weights}"
-            )
-
-    def _current_weight(self, frac: float) -> float:
-        if frac <= self.h.codebook_penalty_start_frac:
-            return 0.0
-        return float(self.h.codebook_penalty_weight)
 
     @torch.no_grad()
     def _refresh_targets(self, step: int) -> None:
-        refreshed: list[dict[str, object]] = []
+        refreshed: list[tuple[CastedLinear, Tensor]] = []
         for name, module in self.target_modules:
-            q_weight = _fast_quantize_weight_target(self.h, name, module.weight)
-            refreshed.append(
-                {
-                    "name": name,
-                    "module": module,
-                    "target_weight": q_weight.detach(),
-                }
-            )
+            refreshed.append((module, _fast_quantize_weight_target(self.h, name, module.weight).detach()))
         self.cached_targets = refreshed
         self.last_refresh_step = step
 
-    def penalty(self, step: int, frac: float) -> Tensor | None:
+    def penalty(self, step: int) -> Tensor | None:
         if not self.active:
             return None
-        weight = self._current_weight(frac)
-        if weight <= 0.0:
+        if self.h.codebook_penalty_weight <= 0.0:
             return None
         if self.last_refresh_step is None or (step - self.last_refresh_step) >= self.h.codebook_penalty_refresh_every:
             self._refresh_targets(step)
         if not self.cached_targets:
             return None
         losses: list[Tensor] = []
-        for item in self.cached_targets:
-            module = item["module"]
-            target_weight = item["target_weight"]
+        for module, target_weight in self.cached_targets:
             diff = module.weight.float() - target_weight.float()
             mse = diff.square().mean()
             denom = target_weight.float().square().mean().clamp_min(1e-8)
             losses.append(mse / denom)
-        if not losses:
-            return None
-        return float(weight) * torch.stack(losses).mean()
+        return float(self.h.codebook_penalty_weight) * torch.stack(losses).mean() if losses else None
 
 
-class CodebookQuantizer:
+class CodebookCodec:
     def __init__(self, h: Hyperparameters, model: nn.Module):
         _validate_codebook_hparams(h)
         self.h = h
         self.states: dict[str, dict[str, object]] = {}
-        self.target_modules: list[tuple[str, CastedLinear]] = []
-        self.target_names: set[str] = set()
-        self.last_fit_summary: dict[str, float] = {}
-        for module_name, module in model.named_modules():
-            if not isinstance(module, CastedLinear):
-                continue
-            weight_name = f"{module_name}.weight"
-            if _should_codebook_quantize(weight_name, module.weight, h):
-                self.target_modules.append((weight_name, module))
-                self.target_names.add(weight_name)
+        self.target_modules = _codebook_target_modules(model, h)
+        self.target_names = {name for name, _ in self.target_modules}
 
     @torch.no_grad()
     def _prepare_rotated_blocks(
@@ -1656,19 +1544,7 @@ class CodebookQuantizer:
             metrics,
             self.h.codebook_lattice_scale,
         )
-        if self.h.codebook_assignment_entropy_weight > 0:
-            e8p_entries = int(_get_e8p_codebook(rotated_blocks.device).grid.shape[0])
-            assignment_log_prior = _log_prior_from_assignments(initial_idx, e8p_entries)
-            fixed_dirs, fixed_idx = _metric_optimal_e8p_codewords(
-                rotated_grid,
-                metrics,
-                self.h.codebook_lattice_scale,
-                assignment_log_prior=assignment_log_prior,
-                assignment_entropy_weight=self.h.codebook_assignment_entropy_weight,
-            )
-        else:
-            assignment_log_prior = None
-            fixed_dirs, fixed_idx = initial_dirs, initial_idx
+        fixed_dirs, fixed_idx = initial_dirs, initial_idx
         scales = _metric_optimal_scales(rotated_grid, fixed_dirs, metrics)
         scales_fp16 = scales.to(dtype=torch.float16)
         recon_rotated = fixed_dirs * scales_fp16.to(dtype=torch.float32)
@@ -1695,17 +1571,12 @@ class CodebookQuantizer:
             "scales": scales_fp16.reshape(-1).cpu().contiguous(),
             "stats": stats,
         }
-        if assignment_log_prior is not None:
-            probs = assignment_log_prior.exp()
-            stats["assignment_prior_entropy"] = float((-(probs * assignment_log_prior).sum()).item())
         self.states[name] = state
         return name, stats
 
     @torch.no_grad()
     def fit(self, model: nn.Module, hessians: dict[str, Tensor]) -> None:
         if not self.target_modules:
-            if self.h.is_main_process:
-                log("codebook:no eligible tensors found")
             return
         total_fp_weights = sum(
             int(t.numel())
@@ -1722,12 +1593,6 @@ class CodebookQuantizer:
             "rel_mse": weighted_rel_mse / max(target_weights, 1),
             "target_bpw": 4.0,
         }
-        if self.h.is_main_process:
-            log(
-                f"codebook:fit target_tensors:{len(fit_items)} target_weights:{target_weights} "
-                f"coverage:{self.last_fit_summary['coverage']:.4%} rel_mse:{self.last_fit_summary['rel_mse']:.6e} "
-                f"target_bpw:{self.last_fit_summary['target_bpw']:.4f}"
-            )
 
     @torch.no_grad()
     def _reconstruct_tensor_from_state(self, name: str, state: dict[str, object], *, dtype: torch.dtype = torch.float32) -> Tensor:
@@ -1752,16 +1617,7 @@ class CodebookQuantizer:
 
     @torch.no_grad()
     def _select_outliers(self, original: Tensor, reconstructed: Tensor) -> tuple[Tensor | None, Tensor | None, Tensor | None]:
-        requested = 0
-        if self.h.codebook_outlier_frac > 0:
-            requested = int(math.ceil(float(self.h.codebook_outlier_frac) * float(original.numel())))
-        if self.h.codebook_outlier_max_count > 0:
-            requested = (
-                min(requested, int(self.h.codebook_outlier_max_count))
-                if requested > 0
-                else int(self.h.codebook_outlier_max_count)
-            )
-        requested = min(requested, int(original.numel()))
+        requested = min(int(self.h.codebook_outlier_max_count), int(original.numel()))
         if requested <= 0:
             return None, None, None
         flat_orig = original.reshape(-1).to(dtype=torch.float32)
@@ -1789,7 +1645,6 @@ class CodebookQuantizer:
     ) -> tuple[dict[str, Tensor], dict[str, object], dict[str, object]]:
         result: dict[str, Tensor] = {}
         meta: dict[str, object] = {}
-        export_stats: dict[str, object] = {"tensors": {}}
         total_payload_bytes = 0
         target_payload_bytes = 0
         outlier_payload_bytes = 0
@@ -1812,7 +1667,7 @@ class CodebookQuantizer:
                 result[name + ".scale"] = scale_payload
                 tensor_outlier_count = 0
                 tensor_outlier_payload_bytes = 0
-                if self.h.codebook_outlier_frac > 0 or self.h.codebook_outlier_max_count > 0:
+                if self.h.codebook_outlier_max_count > 0:
                     reconstructed = self._reconstruct_tensor_from_state(name, state, dtype=torch.float32)
                     outlier_idx, outlier_q, outlier_scale = self._select_outliers(t.float(), reconstructed)
                     if (
@@ -1850,26 +1705,6 @@ class CodebookQuantizer:
                 outlier_payload_bytes += tensor_outlier_payload_bytes
                 outlier_weights += tensor_outlier_count
                 target_weights += int(state["stats"]["num_weights"])
-                export_stats["tensors"][name] = {
-                    **state["stats"],
-                    "payload_bytes": payload_bytes,
-                    "outlier_payload_bytes": tensor_outlier_payload_bytes,
-                    "outlier_count": tensor_outlier_count,
-                    "scale_bits": int(scale_meta["scale_bits"]),
-                    "scale_format": str(scale_meta["scale_format"]),
-                    "bpw": (8.0 * payload_bytes) / max(float(state["stats"]["num_weights"]), 1.0),
-                }
-                export_stats.setdefault("diagnostics", []).append(
-                    _codebook_payload_diagnostics(
-                        name,
-                        idx,
-                        scales,
-                        scale_payload,
-                        tuple(int(x) for x in state["shape"]),
-                        int(state["block_dim"]),
-                        self.h.compressor,
-                    )
-                )
                 continue
 
             if not t.is_floating_point() or t.numel() <= 65536:
@@ -1903,7 +1738,7 @@ class CodebookQuantizer:
             int8_fallback_payload_bytes += payload_bytes
             int8_fallback_weights += int(t.numel())
 
-        export_stats["summary"] = {
+        export_stats = {
             "target_tensors": len(self.states),
             "target_weights": target_weights,
             "coverage": target_weights / max(total_fp_weights, 1),
@@ -2092,196 +1927,8 @@ def _dequantize_codebook_scales(scale_payload: Tensor, info: dict[str, object]) 
     logs = log_min + scale_payload.to(dtype=torch.float32).reshape(-1, 1) * log_step
     return torch.pow(2.0, logs)
 
-
-
-
-def _entropy_from_counts(counts: np.ndarray) -> float:
-    total = int(counts.sum())
-    if total <= 0:
-        return 0.0
-    probs = counts[counts > 0].astype(np.float64) / float(total)
-    return float(-(probs * np.log2(probs)).sum())
-
-
-def _entropy_from_u8_bytes(data: bytes) -> float:
-    if not data:
-        return 0.0
-    arr = np.frombuffer(data, dtype=np.uint8)
-    counts = np.bincount(arr, minlength=256)
-    return _entropy_from_counts(counts)
-
-
-def _adjacent_corrcoef(arr: np.ndarray) -> float:
-    if arr.size < 2:
-        return 1.0
-    x0 = arr[:-1].astype(np.float64, copy=False)
-    x1 = arr[1:].astype(np.float64, copy=False)
-    x0 = x0 - x0.mean()
-    x1 = x1 - x1.mean()
-    denom = math.sqrt(float(np.dot(x0, x0) * np.dot(x1, x1)))
-    if denom <= 0.0:
-        return 1.0
-    return float(np.dot(x0, x1) / denom)
-
-
-def _codebook_payload_diagnostics(
-    name: str,
-    idx: Tensor,
-    scales: Tensor,
-    scale_payload: Tensor,
-    shape: tuple[int, int],
-    block_dim: int,
-    compressor: str,
-) -> dict[str, float | int | str]:
-    idx_np = idx.contiguous().numpy().reshape(-1)
-    idx_codes = idx_np.astype(np.int64, copy=False)
-    scales_np = scales.contiguous().numpy().reshape(-1).astype(np.float16, copy=False)
-    scale_payload_np = scale_payload.contiguous().numpy().reshape(-1)
-    idx_bytes = idx_np.tobytes()
-    scale_bytes = scale_payload_np.tobytes()
-    combined_bytes = idx_bytes + scale_bytes
-
-    idx_max = int(idx_codes.max()) if idx_codes.size else 0
-    idx_counts = np.bincount(idx_codes, minlength=max(idx_max + 1, 1))
-    idx_entropy_bits = _entropy_from_counts(idx_counts)
-    idx_unique = int(np.count_nonzero(idx_counts))
-
-    scale_words = scales_np.view(np.uint16)
-    _, scale_counts = np.unique(scale_words, return_counts=True)
-    scale_value_entropy_bits = _entropy_from_counts(scale_counts)
-
-    scale_grid = scales_np.astype(np.float32, copy=False).reshape(shape[0], shape[1] // block_dim)
-    if scale_grid.shape[1] > 1:
-        scale_deltas = np.diff(scale_grid, axis=1).astype(np.float16, copy=False).reshape(-1)
-        scale_delta_words = scale_deltas.view(np.uint16)
-        _, delta_counts = np.unique(scale_delta_words, return_counts=True)
-        scale_delta_entropy_bits = _entropy_from_counts(delta_counts)
-        scale_delta_mean_abs = float(np.mean(np.abs(scale_deltas.astype(np.float32, copy=False))))
-        scale_adjacent_corr = _adjacent_corrcoef(scale_grid.reshape(-1))
-        scale_relative_delta = scale_delta_mean_abs / max(float(np.mean(np.abs(scale_grid))), 1e-12)
-    else:
-        scale_delta_entropy_bits = 0.0
-        scale_delta_mean_abs = 0.0
-        scale_adjacent_corr = 1.0
-        scale_relative_delta = 0.0
-
-    idx_compressed_bytes = len(_compress(idx_bytes, compressor))
-    scale_compressed_bytes = len(_compress(scale_bytes, compressor))
-    combined_compressed_bytes = len(_compress(combined_bytes, compressor))
-    idx_byte_entropy = _entropy_from_u8_bytes(_byte_shuffle(idx_bytes))
-    scale_byte_entropy = _entropy_from_u8_bytes(_byte_shuffle(scale_bytes))
-
-    return {
-        "name": name,
-        "idx_unique": idx_unique,
-        "idx_entropy_bits": idx_entropy_bits,
-        "idx_byte_entropy_bits": idx_byte_entropy,
-        "idx_raw_bytes": len(idx_bytes),
-        "idx_compressed_bytes": idx_compressed_bytes,
-        "idx_entropy_bound_bytes": (idx_np.size * idx_entropy_bits) / 8.0,
-        "scale_unique": int(scale_counts.size),
-        "scale_value_entropy_bits": scale_value_entropy_bits,
-        "scale_delta_entropy_bits": scale_delta_entropy_bits,
-        "scale_byte_entropy_bits": scale_byte_entropy,
-        "scale_raw_bytes": len(scale_bytes),
-        "scale_compressed_bytes": scale_compressed_bytes,
-        "scale_entropy_bound_bytes": (scales_np.size * scale_value_entropy_bits) / 8.0,
-        "scale_delta_mean_abs": scale_delta_mean_abs,
-        "scale_relative_delta": scale_relative_delta,
-        "scale_adjacent_corr": scale_adjacent_corr,
-        "scale_storage_bits": float(8.0 * len(scale_bytes) / max(scale_payload_np.size, 1)),
-        "combined_raw_bytes": len(combined_bytes),
-        "combined_compressed_bytes": combined_compressed_bytes,
-    }
-
-
-def _select_codebook_focus_tensor(
-    diagnostics: list[dict[str, float | int | str]],
-    focus: str,
-) -> dict[str, float | int | str] | None:
-    if not diagnostics:
-        return None
-    if focus:
-        for item in diagnostics:
-            if item["name"] == focus:
-                return item
-        for item in diagnostics:
-            if focus in str(item["name"]):
-                return item
-    return max(diagnostics, key=lambda item: float(item["scale_compressed_bytes"]))
-
-
-def _log_codebook_diagnostics(h: Hyperparameters, quant_stats: dict[str, object]) -> None:
-    diagnostics = list(quant_stats.get("diagnostics", []))
-    if not diagnostics:
-        return
-    topk = max(int(h.codebook_entropy_summary_topk), 0)
-    total_idx_compressed = sum(int(item["idx_compressed_bytes"]) for item in diagnostics)
-    total_scale_compressed = sum(int(item["scale_compressed_bytes"]) for item in diagnostics)
-    total_combined_compressed = sum(int(item["combined_compressed_bytes"]) for item in diagnostics)
-    log(
-        f"codebook:entropy_summary tensors:{len(diagnostics)} "
-        f"idx_compressed_bytes:{total_idx_compressed} "
-        f"scale_compressed_bytes:{total_scale_compressed} "
-        f"combined_compressed_bytes:{total_combined_compressed}"
-    )
-    if topk > 0:
-        ranked = sorted(
-            diagnostics,
-            key=lambda item: (float(item["scale_compressed_bytes"]), float(item["combined_compressed_bytes"])),
-            reverse=True,
-        )[:topk]
-        for item in ranked:
-            log(
-                "codebook:tensor "
-                f"name:{item['name']} "
-                f"idx_raw:{item['idx_raw_bytes']} idx_zip:{item['idx_compressed_bytes']} "
-                f"scale_raw:{item['scale_raw_bytes']} scale_zip:{item['scale_compressed_bytes']} "
-                f"combined_zip:{item['combined_compressed_bytes']} "
-                f"idx_H:{float(item['idx_entropy_bits']):.3f}bits "
-                f"scale_H:{float(item['scale_value_entropy_bits']):.3f}bits "
-                f"scale_dH:{float(item['scale_delta_entropy_bits']):.3f}bits "
-                f"scale_store:{float(item['scale_storage_bits']):.1f}bits "
-                f"scale_rel_delta:{float(item['scale_relative_delta']):.5f} "
-                f"scale_corr:{float(item['scale_adjacent_corr']):.5f}"
-            )
-    focus_item = _select_codebook_focus_tensor(diagnostics, h.codebook_entropy_focus)
-    if focus_item is None:
-        return
-    log(
-        "codebook:focus "
-        f"name:{focus_item['name']} "
-        f"idx_unique:{focus_item['idx_unique']} "
-        f"idx_H:{float(focus_item['idx_entropy_bits']):.4f}bits "
-        f"idx_byte_H:{float(focus_item['idx_byte_entropy_bits']):.4f}bits "
-        f"idx_raw:{focus_item['idx_raw_bytes']} "
-        f"idx_entropy_bound:{float(focus_item['idx_entropy_bound_bytes']):.1f} "
-        f"idx_zip:{focus_item['idx_compressed_bytes']}"
-    )
-    log(
-        "codebook:focus "
-        f"name:{focus_item['name']} "
-        f"scale_unique:{focus_item['scale_unique']} "
-        f"scale_H:{float(focus_item['scale_value_entropy_bits']):.4f}bits "
-        f"scale_dH:{float(focus_item['scale_delta_entropy_bits']):.4f}bits "
-        f"scale_byte_H:{float(focus_item['scale_byte_entropy_bits']):.4f}bits "
-        f"scale_store:{float(focus_item['scale_storage_bits']):.1f}bits "
-        f"scale_raw:{focus_item['scale_raw_bytes']} "
-        f"scale_entropy_bound:{float(focus_item['scale_entropy_bound_bytes']):.1f} "
-        f"scale_zip:{focus_item['scale_compressed_bytes']}"
-    )
-    log(
-        "codebook:focus "
-        f"name:{focus_item['name']} "
-        f"combined_zip:{focus_item['combined_compressed_bytes']} "
-        f"scale_delta_mean_abs:{float(focus_item['scale_delta_mean_abs']):.6f} "
-        f"scale_rel_delta:{float(focus_item['scale_relative_delta']):.6f} "
-        f"scale_adjacent_corr:{float(focus_item['scale_adjacent_corr']):.6f}"
-    )
-
-
 def serialize(h: Hyperparameters, base_model: torch.nn.Module, code: str) -> int:
-    quantizer = CodebookQuantizer(h, base_model)
+    quantizer = CodebookCodec(h, base_model)
     device = next(base_model.parameters()).device
     code_bytes = len(code.encode("utf-8"))
     bytes_total = code_bytes
@@ -2321,33 +1968,10 @@ def serialize(h: Hyperparameters, base_model: torch.nn.Module, code: str) -> int
         bytes_total = quant_file_bytes + code_bytes
         with open(h.quantized_model_path, "wb") as f:
             f.write(quant_blob)
-        summary = quant_stats["summary"]
         log(
             f"Serialized model codebook+{h.compressor}: {quant_file_bytes} bytes "
-            f"(payload_before_torchsave:{summary['payload_bytes_before_torchsave']} bytes)"
+            f"(payload_before_torchsave:{quant_stats['payload_bytes_before_torchsave']} bytes)"
         )
-        log(
-            f"Codebook coverage:{summary['coverage']:.4%} target_bpw:{summary['target_bpw']:.4f} "
-            f"effective_payload_bpw_all_weights:{summary['effective_payload_bpw_all_weights']:.4f}"
-        )
-        log(
-            f"Codebook scale_codec:{'fp16' if h.codebook_scale_bits >= 16 else 'log'} "
-            f"scale_bits:{h.codebook_scale_bits} "
-            f"entropy_weight:{h.codebook_assignment_entropy_weight:.4f}"
-        )
-        log(
-            f"Codebook outliers frac:{h.codebook_outlier_frac:.6f} "
-            f"max_count:{h.codebook_outlier_max_count} "
-            f"outlier_weights:{summary['outlier_weights']} "
-            f"outlier_bytes:{summary['outlier_payload_bytes']}"
-        )
-        log(
-            f"Fallback payloads int8_weights:{summary['int8_fallback_weights']} "
-            f"int8_bytes:{summary['int8_fallback_payload_bytes']} "
-            f"passthrough_weights:{summary['passthrough_weights']} "
-            f"passthrough_bytes:{summary['passthrough_payload_bytes']}"
-        )
-        _log_codebook_diagnostics(h, quant_stats)
         log(f"Total submission size codebook+{h.compressor}: {bytes_total} bytes")
     return bytes_total
 
@@ -2546,8 +2170,7 @@ def train_model(h: Hyperparameters, device: torch.device, val_data: ValidationDa
     # Set up optimizer and load train data
     optimizers = Optimizers(h, base_model)
     train_loader = DistributedTokenLoader( h.train_files, h.rank, h.world_size, device)
-    soft_snap = FixedCodebookSoftSnap(h, base_model) if h.codebook_soft_snap_enabled else None
-    codebook_penalty = FixedCodebookPenalty(h, base_model) if h.codebook_penalty_enabled else None
+    codebook_penalty = CodebookPenalty(h, base_model) if h.codebook_penalty_enabled else None
 
     # Helper functions for training
     max_wallclock_ms = 1000.0 * h.max_wallclock_seconds if h.max_wallclock_seconds > 0 else None
@@ -2592,7 +2215,7 @@ def train_model(h: Hyperparameters, device: torch.device, val_data: ValidationDa
 
         codebook_penalty_loss = None
         if codebook_penalty is not None:
-            codebook_penalty_loss = codebook_penalty.penalty(step, frac)
+            codebook_penalty_loss = codebook_penalty.penalty(step)
             if codebook_penalty_loss is not None:
                 codebook_penalty_loss.backward()
 
@@ -2600,8 +2223,6 @@ def train_model(h: Hyperparameters, device: torch.device, val_data: ValidationDa
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), h.grad_clip_norm)
 
         optimizers.step()
-        if soft_snap is not None:
-            soft_snap.apply(step + 1)
         return train_loss, codebook_penalty_loss
 
     # Model warmup
@@ -2655,10 +2276,8 @@ def train_model(h: Hyperparameters, device: torch.device, val_data: ValidationDa
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         frac = training_frac(step, elapsed_ms)
-        if soft_snap is not None and soft_snap.should_activate(frac):
-            soft_snap.activate(step, frac)
         if codebook_penalty is not None and codebook_penalty.should_activate(frac):
-            codebook_penalty.activate(step, frac)
+            codebook_penalty.activate()
         scale = lr_mul(frac)
         train_loss, codebook_penalty_loss = step_fn(step, scale, frac)
 
