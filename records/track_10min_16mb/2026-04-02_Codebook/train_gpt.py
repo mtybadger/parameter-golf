@@ -125,6 +125,8 @@ class Hyperparameters():
     codebook_penalty_refresh_every = int(
         os.environ.get("CODEBOOK_PENALTY_REFRESH_EVERY", os.environ.get("CODEBOOK_STALE_PENALTY_REFRESH_EVERY", 16))
     )
+    codebook_outlier_frac = float(os.environ.get("CODEBOOK_OUTLIER_FRAC", 0.0))
+    codebook_outlier_max_count = int(os.environ.get("CODEBOOK_OUTLIER_MAX_COUNT", 0))
     codebook_entropy_summary_topk = int(os.environ.get("CODEBOOK_ENTROPY_SUMMARY_TOPK", 12))
     codebook_entropy_focus = os.environ.get("CODEBOOK_ENTROPY_FOCUS", "").strip()
 
@@ -975,6 +977,10 @@ def _validate_codebook_hparams(h: Hyperparameters) -> None:
         raise ValueError(
             f"CODEBOOK_PENALTY_REFRESH_EVERY must be positive, got {h.codebook_penalty_refresh_every}"
         )
+    if not 0.0 <= h.codebook_outlier_frac <= 1.0:
+        raise ValueError(f"CODEBOOK_OUTLIER_FRAC must be in [0, 1], got {h.codebook_outlier_frac}")
+    if h.codebook_outlier_max_count < 0:
+        raise ValueError(f"CODEBOOK_OUTLIER_MAX_COUNT must be non-negative, got {h.codebook_outlier_max_count}")
 
 
 def _blockify_weight(t: Tensor, block_dim: int) -> tuple[Tensor, tuple[int, int]]:
@@ -1723,6 +1729,60 @@ class CodebookQuantizer:
                 f"target_bpw:{self.last_fit_summary['target_bpw']:.4f}"
             )
 
+    @torch.no_grad()
+    def _reconstruct_tensor_from_state(self, name: str, state: dict[str, object], *, dtype: torch.dtype = torch.float32) -> Tensor:
+        shape = tuple(int(x) for x in state["shape"])
+        block_dim = int(state["block_dim"])
+        idx = state["fixed_idx"].to(dtype=torch.int64)
+        scales = state["scales"].to(dtype=torch.float32).view(-1, 1)
+        fixed_blocks = _decode_e8p_blocks(
+            idx,
+            float(self.h.codebook_lattice_scale),
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        rotated_blocks = fixed_blocks * scales
+        sign_vec = _hadamard_sign_vector(name, block_dim, device=torch.device("cpu"), dtype=torch.float32)
+        blocks = hadamard_unrotate_blocks(
+            rotated_blocks,
+            sign_vec,
+            enabled=bool(self.h.codebook_use_hadamard),
+        )
+        return _unblockify_weight(blocks, shape).to(dtype)
+
+    @torch.no_grad()
+    def _select_outliers(self, original: Tensor, reconstructed: Tensor) -> tuple[Tensor | None, Tensor | None, Tensor | None]:
+        requested = 0
+        if self.h.codebook_outlier_frac > 0:
+            requested = int(math.ceil(float(self.h.codebook_outlier_frac) * float(original.numel())))
+        if self.h.codebook_outlier_max_count > 0:
+            requested = (
+                min(requested, int(self.h.codebook_outlier_max_count))
+                if requested > 0
+                else int(self.h.codebook_outlier_max_count)
+            )
+        requested = min(requested, int(original.numel()))
+        if requested <= 0:
+            return None, None, None
+        flat_orig = original.reshape(-1).to(dtype=torch.float32)
+        flat_recon = reconstructed.reshape(-1).to(dtype=torch.float32)
+        err = (flat_orig - flat_recon).square()
+        if requested >= flat_orig.numel():
+            idx = torch.arange(flat_orig.numel(), dtype=torch.int32)
+        else:
+            idx = torch.topk(err, k=requested, largest=True, sorted=False).indices.to(dtype=torch.int64)
+            idx = idx.index_select(0, torch.argsort(idx)).to(dtype=torch.int32).cpu()
+        vals = flat_orig.index_select(0, idx.to(dtype=torch.int64)).cpu().contiguous()
+        max_abs = float(vals.abs().max().item()) if vals.numel() > 0 else 0.0
+        if max_abs <= 1e-12:
+            scale = torch.ones((1,), dtype=torch.float16)
+            q = torch.zeros(vals.numel(), dtype=torch.int8)
+        else:
+            scale_value = max_abs / 127.0
+            q = torch.round(vals / scale_value).clamp_(-127, 127).to(dtype=torch.int8).contiguous()
+            scale = torch.tensor([scale_value], dtype=torch.float16)
+        return idx.contiguous(), q.cpu().contiguous(), scale.cpu().contiguous()
+
     def build_export(
         self,
         state_dict: dict[str, Tensor],
@@ -1732,6 +1792,8 @@ class CodebookQuantizer:
         export_stats: dict[str, object] = {"tensors": {}}
         total_payload_bytes = 0
         target_payload_bytes = 0
+        outlier_payload_bytes = 0
+        outlier_weights = 0
         int8_fallback_payload_bytes = 0
         int8_fallback_weights = 0
         passthrough_payload_bytes = 0
@@ -1748,24 +1810,51 @@ class CodebookQuantizer:
                 scale_payload, scale_meta = _quantize_codebook_scales(scales, self.h.codebook_scale_bits)
                 result[name + ".idx"] = idx
                 result[name + ".scale"] = scale_payload
+                tensor_outlier_count = 0
+                tensor_outlier_payload_bytes = 0
+                if self.h.codebook_outlier_frac > 0 or self.h.codebook_outlier_max_count > 0:
+                    reconstructed = self._reconstruct_tensor_from_state(name, state, dtype=torch.float32)
+                    outlier_idx, outlier_q, outlier_scale = self._select_outliers(t.float(), reconstructed)
+                    if (
+                        outlier_idx is not None
+                        and outlier_q is not None
+                        and outlier_scale is not None
+                        and outlier_idx.numel() > 0
+                    ):
+                        result[name + ".outlier_idx"] = outlier_idx
+                        result[name + ".outlier_q"] = outlier_q
+                        result[name + ".outlier_scale"] = outlier_scale
+                        tensor_outlier_count = int(outlier_idx.numel())
+                        tensor_outlier_payload_bytes = (
+                            outlier_idx.numel() * outlier_idx.element_size()
+                            + outlier_q.numel() * outlier_q.element_size()
+                            + outlier_scale.numel() * outlier_scale.element_size()
+                        )
                 meta[name] = {
                     "type": "codebook_e8p",
                     "shape": list(state["shape"]),
                     "block_dim": int(state["block_dim"]),
                     "hadamard": bool(self.h.codebook_use_hadamard),
                     "lattice_scale": float(self.h.codebook_lattice_scale),
+                    "outlier_count": tensor_outlier_count,
+                    "outlier_format": "int8" if tensor_outlier_count > 0 else "none",
                     **scale_meta,
                 }
                 payload_bytes = (
                     idx.numel() * idx.element_size()
                     + scale_payload.numel() * scale_payload.element_size()
+                    + tensor_outlier_payload_bytes
                 )
                 total_payload_bytes += payload_bytes
                 target_payload_bytes += payload_bytes
+                outlier_payload_bytes += tensor_outlier_payload_bytes
+                outlier_weights += tensor_outlier_count
                 target_weights += int(state["stats"]["num_weights"])
                 export_stats["tensors"][name] = {
                     **state["stats"],
                     "payload_bytes": payload_bytes,
+                    "outlier_payload_bytes": tensor_outlier_payload_bytes,
+                    "outlier_count": tensor_outlier_count,
                     "scale_bits": int(scale_meta["scale_bits"]),
                     "scale_format": str(scale_meta["scale_format"]),
                     "bpw": (8.0 * payload_bytes) / max(float(state["stats"]["num_weights"]), 1.0),
@@ -1820,6 +1909,8 @@ class CodebookQuantizer:
             "coverage": target_weights / max(total_fp_weights, 1),
             "target_payload_bytes": target_payload_bytes,
             "target_bpw": (8.0 * target_payload_bytes) / max(target_weights, 1),
+            "outlier_weights": outlier_weights,
+            "outlier_payload_bytes": outlier_payload_bytes,
             "int8_fallback_weights": int8_fallback_weights,
             "int8_fallback_payload_bytes": int8_fallback_payload_bytes,
             "passthrough_weights": passthrough_weights,
@@ -1879,7 +1970,16 @@ def dequantize_state_dict_codebook(
             sign_vec,
             enabled=bool(info.get("hadamard", True)),
         )
-        out[name] = _unblockify_weight(blocks, shape).to(orig.dtype)
+        restored = _unblockify_weight(blocks, shape).to(orig.dtype)
+        if int(info.get("outlier_count", 0)) > 0:
+            flat = restored.reshape(-1)
+            outlier_idx = result[name + ".outlier_idx"].to(dtype=torch.int64)
+            outlier_q = result[name + ".outlier_q"].to(dtype=torch.float32).reshape(-1)
+            outlier_scale = float(result[name + ".outlier_scale"].to(dtype=torch.float32).reshape(-1)[0].item())
+            outlier_val = (outlier_q * outlier_scale).to(dtype=orig.dtype)
+            flat[outlier_idx] = outlier_val
+            restored = flat.view_as(restored)
+        out[name] = restored
     return out
 
 
@@ -2234,6 +2334,12 @@ def serialize(h: Hyperparameters, base_model: torch.nn.Module, code: str) -> int
             f"Codebook scale_codec:{'fp16' if h.codebook_scale_bits >= 16 else 'log'} "
             f"scale_bits:{h.codebook_scale_bits} "
             f"entropy_weight:{h.codebook_assignment_entropy_weight:.4f}"
+        )
+        log(
+            f"Codebook outliers frac:{h.codebook_outlier_frac:.6f} "
+            f"max_count:{h.codebook_outlier_max_count} "
+            f"outlier_weights:{summary['outlier_weights']} "
+            f"outlier_bytes:{summary['outlier_payload_bytes']}"
         )
         log(
             f"Fallback payloads int8_weights:{summary['int8_fallback_weights']} "
