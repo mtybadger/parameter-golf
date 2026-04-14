@@ -906,6 +906,13 @@ class HopperWgmmaGemmKernel:
         tile_m_offset = pid_m * self.tile_shape_mnk[0]
         tile_n_offset = pid_n * self.tile_shape_mnk[1]
         problem_shape_mn = (mC_mnl.shape[0], mC_mnl.shape[1])
+        tile_is_full = (
+            tile_m_offset + self.tile_shape_mnk[0] <= problem_shape_mn[0]
+            and tile_n_offset + self.tile_shape_mnk[1] <= problem_shape_mn[1]
+        )
+        lane_idx = cute.arch.lane_idx()
+        scale_row_0 = warp_idx * 16 + lane_idx // 4
+        scale_row_1 = scale_row_0 + 8
 
         for _ in cutlass.range(k_tile_cnt, unroll=1):
             # /////////////////////////////////////////////////////////////////////////////
@@ -918,7 +925,6 @@ class HopperWgmmaGemmKernel:
             # /////////////////////////////////////////////////////////////////////////////
             #  WGMMA for the current 128-wide K group
             # /////////////////////////////////////////////////////////////////////////////
-            accumulators_tmp.fill(0.0)
             tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, False)
             cute.nvgpu.warpgroup.fence()
             for k_block_idx in cutlass.range(num_k_blocks, unroll_full=True):
@@ -946,23 +952,111 @@ class HopperWgmmaGemmKernel:
             # /////////////////////////////////////////////////////////////////////////////
             #  Promote the temporary RMEM fragment with staged scales
             # /////////////////////////////////////////////////////////////////////////////
-            for i in cutlass.range_constexpr(cute.size(tPromote_rAcc.shape)):
-                local_coord = tPromote_cC[i]
-                global_row = tile_m_offset + local_coord[0]
-                global_col = tile_n_offset + local_coord[1]
-                if cute.elem_less((global_row, global_col), problem_shape_mn):
-                    scale_a = sSFA[
-                        (local_coord[0], 0, mainloop_consumer_release_state.index)
-                    ].to(self.acc_dtype)
-                    scale_b = sSFB[
-                        (
-                            local_coord[1] // self.scale_granularity_n,
-                            mainloop_consumer_release_state.count,
-                        )
-                    ].to(self.acc_dtype)
-                    tPromote_rAcc[i] = (
-                        tPromote_rAcc[i] + tPromote_rAcc_tmp[i] * (scale_a * scale_b)
+            scale_stage_idx = mainloop_consumer_release_state.index
+            scale_k_idx = mainloop_consumer_release_state.count
+            # The StMatrix store path exposes accumulators in 4-value quads that
+            # correspond to a 2x2 fragment inside an 8-column group. Promoting in
+            # that order lets us reuse row/column scales instead of reloading them
+            # for every single accumulator element.
+            scale_a_0 = self.acc_dtype(0.0)
+            scale_a_1 = self.acc_dtype(0.0)
+            if tile_is_full:
+                scale_a_0 = sSFA[(scale_row_0, 0, scale_stage_idx)].to(self.acc_dtype)
+                scale_a_1 = sSFA[(scale_row_1, 0, scale_stage_idx)].to(self.acc_dtype)
+            if tile_is_full and self.scale_n_groups_per_tile == 1:
+                scale_b = sSFB[(0, scale_k_idx)].to(self.acc_dtype)
+                scale_0 = scale_a_0 * scale_b
+                scale_1 = scale_a_1 * scale_b
+                for i in cutlass.range_constexpr(0, cute.size(tPromote_rAcc.shape), 4):
+                    tPromote_rAcc[i + 0] = (
+                        tPromote_rAcc[i + 0] + tPromote_rAcc_tmp[i + 0] * scale_0
                     )
+                    tPromote_rAcc[i + 1] = (
+                        tPromote_rAcc[i + 1] + tPromote_rAcc_tmp[i + 1] * scale_0
+                    )
+                    tPromote_rAcc[i + 2] = (
+                        tPromote_rAcc[i + 2] + tPromote_rAcc_tmp[i + 2] * scale_1
+                    )
+                    tPromote_rAcc[i + 3] = (
+                        tPromote_rAcc[i + 3] + tPromote_rAcc_tmp[i + 3] * scale_1
+                    )
+            else:
+                for i in cutlass.range_constexpr(0, cute.size(tPromote_rAcc.shape), 4):
+                    coord_00 = tPromote_cC[i + 0]
+                    coord_01 = tPromote_cC[i + 1]
+                    coord_10 = tPromote_cC[i + 2]
+                    coord_11 = tPromote_cC[i + 3]
+
+                    if not tile_is_full:
+                        scale_a_0 = sSFA[(coord_00[0], 0, scale_stage_idx)].to(
+                            self.acc_dtype
+                        )
+                        scale_a_1 = sSFA[(coord_10[0], 0, scale_stage_idx)].to(
+                            self.acc_dtype
+                        )
+                    scale_b_0 = sSFB[
+                        (coord_00[1] // self.scale_granularity_n, scale_k_idx)
+                    ].to(self.acc_dtype)
+                    scale_b_1 = sSFB[
+                        (coord_01[1] // self.scale_granularity_n, scale_k_idx)
+                    ].to(self.acc_dtype)
+
+                    scale_00 = scale_a_0 * scale_b_0
+                    scale_01 = scale_a_0 * scale_b_1
+                    scale_10 = scale_a_1 * scale_b_0
+                    scale_11 = scale_a_1 * scale_b_1
+
+                    if tile_is_full:
+                        tPromote_rAcc[i + 0] = (
+                            tPromote_rAcc[i + 0] + tPromote_rAcc_tmp[i + 0] * scale_00
+                        )
+                        tPromote_rAcc[i + 1] = (
+                            tPromote_rAcc[i + 1] + tPromote_rAcc_tmp[i + 1] * scale_01
+                        )
+                        tPromote_rAcc[i + 2] = (
+                            tPromote_rAcc[i + 2] + tPromote_rAcc_tmp[i + 2] * scale_10
+                        )
+                        tPromote_rAcc[i + 3] = (
+                            tPromote_rAcc[i + 3] + tPromote_rAcc_tmp[i + 3] * scale_11
+                        )
+                    else:
+                        global_coord_00 = (
+                            tile_m_offset + coord_00[0],
+                            tile_n_offset + coord_00[1],
+                        )
+                        global_coord_01 = (
+                            tile_m_offset + coord_01[0],
+                            tile_n_offset + coord_01[1],
+                        )
+                        global_coord_10 = (
+                            tile_m_offset + coord_10[0],
+                            tile_n_offset + coord_10[1],
+                        )
+                        global_coord_11 = (
+                            tile_m_offset + coord_11[0],
+                            tile_n_offset + coord_11[1],
+                        )
+
+                        if cute.elem_less(global_coord_00, problem_shape_mn):
+                            tPromote_rAcc[i + 0] = (
+                                tPromote_rAcc[i + 0]
+                                + tPromote_rAcc_tmp[i + 0] * scale_00
+                            )
+                        if cute.elem_less(global_coord_01, problem_shape_mn):
+                            tPromote_rAcc[i + 1] = (
+                                tPromote_rAcc[i + 1]
+                                + tPromote_rAcc_tmp[i + 1] * scale_01
+                            )
+                        if cute.elem_less(global_coord_10, problem_shape_mn):
+                            tPromote_rAcc[i + 2] = (
+                                tPromote_rAcc[i + 2]
+                                + tPromote_rAcc_tmp[i + 2] * scale_10
+                            )
+                        if cute.elem_less(global_coord_11, problem_shape_mn):
+                            tPromote_rAcc[i + 3] = (
+                                tPromote_rAcc[i + 3]
+                                + tPromote_rAcc_tmp[i + 3] * scale_11
+                            )
 
             mainloop_pipeline.consumer_release(mainloop_consumer_release_state)
 
