@@ -20,7 +20,7 @@ class Hyperparameters:
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 6e2))
     val_batch_tokens = int(os.environ.get("VAL_BATCH_TOKENS", 524288))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 2048))
-    val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 4000))
+    val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 8000))
     sliding_window_enabled = bool(int(os.environ.get("SLIDING_WINDOW_ENABLED", "1")))
     vocab_size = int(os.environ.get("VOCAB_SIZE", 8192))
     num_layers = int(os.environ.get("NUM_LAYERS", 11))
@@ -359,15 +359,13 @@ class Rotary(nn.Module):
 
 
 def apply_rotary_emb(x, cos, sin, rope_dims=0):
-    if rope_dims > 0 and rope_dims < x.size(-1):
-        x_rope, x_pass = x[..., :rope_dims], x[..., rope_dims:]
-        half = rope_dims // 2
-        x1, x2 = x_rope[..., :half], x_rope[..., half:]
-        x_rope = torch.cat((x1 * cos + x2 * sin, x1 * -sin + x2 * cos), dim=-1)
-        return torch.cat((x_rope, x_pass), dim=-1)
-    half = x.size(-1) // 2
-    x1, x2 = x[..., :half], x[..., half:]
-    return torch.cat((x1 * cos + x2 * sin, x1 * -sin + x2 * cos), dim=-1)
+    rd = rope_dims if (rope_dims > 0 and rope_dims < x.size(-1)) else x.size(-1)
+    half = rd // 2
+    x1 = x[..., :half].clone()
+    x2 = x[..., half:rd]
+    x[..., :half] = x1 * cos + x2 * sin
+    x[..., half:rd] = x1 * -sin + x2 * cos
+    return x
 
 
 class CausalSelfAttention(nn.Module):

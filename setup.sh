@@ -41,6 +41,10 @@ cd data
 git lfs pull -I "datasets/fineweb10B_sp4096/*"
 git lfs pull -I "tokenizers/fineweb_4096_bpe.model"
 
+cd data
+git lfs pull -I "datasets/fineweb10B_sp8192/*"
+git lfs pull -I "tokenizers/fineweb_8192_bpe.model"
+
 echo
 echo "Setup finished. Activate the venv in this shell with:"
 echo "  source ${PROJECT_ROOT}/.venv/bin/activate"
